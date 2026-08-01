@@ -108,9 +108,19 @@ def partition_target(frame: pd.DataFrame, *, partition_name: str) -> np.ndarray:
 
 def calibration_loan_amounts(frame: pd.DataFrame) -> np.ndarray:
     try:
-        numeric = pd.to_numeric(frame["loan_amnt"], errors="raise")
+        raw_values = frame["loan_amnt"].to_numpy(copy=True)
+    except KeyError as exc:
+        raise ValueError("calibration loan_amnt must contain numeric values") from exc
+    contains_boolean = np.issubdtype(raw_values.dtype, np.bool_) or (
+        raw_values.dtype == object
+        and any(isinstance(value, (bool, np.bool_)) for value in raw_values)
+    )
+    if contains_boolean:
+        raise ValueError("calibration loan_amnt must not contain boolean values")
+    try:
+        numeric = pd.to_numeric(raw_values, errors="raise")
         amounts = np.asarray(numeric, dtype=float)
-    except (KeyError, TypeError, ValueError) as exc:
+    except (TypeError, ValueError) as exc:
         raise ValueError("calibration loan_amnt must contain numeric values") from exc
     if not np.isfinite(amounts).all():
         raise ValueError("calibration loan_amnt must contain only finite values")

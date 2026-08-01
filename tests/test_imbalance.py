@@ -429,6 +429,22 @@ def test_calibration_loan_amounts_rejects_invalid_values(value: object, message:
         train_script.calibration_loan_amounts(pd.DataFrame({"loan_amnt": [value]}))
 
 
+@pytest.mark.parametrize(
+    "values",
+    [
+        [True, False],
+        [np.bool_(True)],
+        ["1000", True],
+        [1000.0, np.bool_(False)],
+    ],
+)
+def test_calibration_loan_amounts_rejects_boolean_values(values: list[object]) -> None:
+    train_script = _load_train_script("train_boolean_calibration_loan_amounts")
+
+    with pytest.raises(ValueError, match="calibration loan_amnt.*boolean"):
+        train_script.calibration_loan_amounts(pd.DataFrame({"loan_amnt": values}))
+
+
 def test_train_main_anchors_project_paths_when_called_from_another_working_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
