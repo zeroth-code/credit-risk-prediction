@@ -1,0 +1,43 @@
+[project]
+name = "credit-risk-prediction"
+version = "0.1.0"
+description = "Temporal credit default prediction portfolio project"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fairlearn",
+    "imbalanced-learn",
+    "joblib",
+    # SHAP otherwise resolves Python-3.12-incompatible legacy releases.
+    "llvmlite>=0.46",
+    "lightgbm",
+    "matplotlib",
+    "numba>=0.63",
+    "numpy",
+    "optuna",
+    "pandas",
+    "plotly",
+    "pyarrow",
+    "pydantic",
+    "pyyaml",
+    "scikit-learn",
+    "scipy",
+    "seaborn",
+    "shap",
+    "streamlit",
+]
+
+[dependency-groups]
+dev = ["pytest", "pytest-cov", "ruff"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]

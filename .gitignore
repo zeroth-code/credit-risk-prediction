@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.streamlit/secrets.toml
+data/raw/*
+data/processed/*
+artifacts/*
+reports/figures/*
+*.joblib
+*.parquet
+*.csv
+.DS_Store
+!artifacts/release/
+!artifacts/release/**
