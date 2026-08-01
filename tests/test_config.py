@@ -71,6 +71,15 @@ def test_cost_scenario_rejects_invalid_costs() -> None:
         CostScenario(lgd=1.01, margin=0.05, review_cost=30.0)
 
 
+@pytest.mark.parametrize("field", ["lgd", "margin", "review_cost"])
+def test_cost_scenario_rejects_boolean_costs(field: str) -> None:
+    payload = {"lgd": 0.60, "margin": 0.05, "review_cost": 30.0}
+    payload[field] = True
+
+    with pytest.raises(ValidationError):
+        CostScenario.model_validate(payload)
+
+
 @pytest.mark.parametrize(
     ("model", "payload"),
     [
@@ -103,11 +112,18 @@ def test_config_models_forbid_unknown_fields(
         ("review_cost_values", [float("nan")]),
     ],
 )
-def test_cost_config_rejects_invalid_sensitivity_values(
-    field: str, values: list[float]
-) -> None:
+def test_cost_config_rejects_invalid_sensitivity_values(field: str, values: list[float]) -> None:
     payload = _cost_config_payload()
     payload[field] = values
+
+    with pytest.raises(ValidationError):
+        CostConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize("field", ["lgd_values", "margin_values", "review_cost_values"])
+def test_cost_config_rejects_boolean_sensitivity_values(field: str) -> None:
+    payload = _cost_config_payload()
+    payload[field] = [True]
 
     with pytest.raises(ValidationError):
         CostConfig.model_validate(payload)
@@ -117,6 +133,16 @@ def test_cost_config_rejects_invalid_sensitivity_values(
 def test_project_config_requires_nonempty_labeled_statuses(field: str) -> None:
     payload = _project_config_payload()
     payload[field] = []
+
+    with pytest.raises(ValidationError):
+        ProjectConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize("field", ["good_statuses", "bad_statuses", "unresolved_statuses"])
+@pytest.mark.parametrize("status", ["", "   "])
+def test_project_config_rejects_blank_statuses(field: str, status: str) -> None:
+    payload = _project_config_payload()
+    payload[field] = [status]
 
     with pytest.raises(ValidationError):
         ProjectConfig.model_validate(payload)
@@ -154,7 +180,7 @@ def test_project_config_rejects_overlapping_status_groups(field: str, statuses: 
         ProjectConfig.model_validate(payload)
 
 
-@pytest.mark.parametrize("methods", [[], ["invalid"]])
+@pytest.mark.parametrize("methods", [[], ["invalid"], ["sigmoid", "sigmoid"]])
 def test_project_config_rejects_invalid_calibration_methods(methods: list[str]) -> None:
     payload = _project_config_payload()
     payload["calibration_methods"] = methods
@@ -166,6 +192,14 @@ def test_project_config_rejects_invalid_calibration_methods(methods: list[str]) 
 def test_project_config_rejects_boolean_random_seed() -> None:
     payload = _project_config_payload()
     payload["random_seed"] = True
+
+    with pytest.raises(ValidationError):
+        ProjectConfig.model_validate(payload)
+
+
+def test_project_config_rejects_boolean_minimum_group_size() -> None:
+    payload = _project_config_payload()
+    payload["minimum_group_size"] = True
 
     with pytest.raises(ValidationError):
         ProjectConfig.model_validate(payload)

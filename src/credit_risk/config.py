@@ -7,13 +7,16 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
-    FiniteFloat,
+    StrictFloat,
     StrictInt,
+    StringConstraints,
     model_validator,
 )
 
-Probability = Annotated[FiniteFloat, Field(ge=0, le=1)]
-NonnegativeCost = Annotated[FiniteFloat, Field(ge=0)]
+StrictFiniteFloat = Annotated[StrictFloat, Field(allow_inf_nan=False)]
+Probability = Annotated[StrictFiniteFloat, Field(ge=0, le=1)]
+NonnegativeCost = Annotated[StrictFiniteFloat, Field(ge=0)]
+NonBlankString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
 class ConfigModel(BaseModel):
@@ -55,11 +58,11 @@ class ProjectConfig(ConfigModel):
     calibration: DateWindow
     test: DateWindow
     loan_term: str
-    good_statuses: list[str] = Field(min_length=1)
-    bad_statuses: list[str] = Field(min_length=1)
-    unresolved_statuses: list[str]
+    good_statuses: list[NonBlankString] = Field(min_length=1)
+    bad_statuses: list[NonBlankString] = Field(min_length=1)
+    unresolved_statuses: list[NonBlankString]
     calibration_methods: list[Literal["uncalibrated", "sigmoid", "isotonic"]] = Field(min_length=1)
-    minimum_group_size: int = Field(ge=1)
+    minimum_group_size: StrictInt = Field(ge=1)
     costs: CostConfig
 
     @model_validator(mode="after")
@@ -75,6 +78,9 @@ class ProjectConfig(ConfigModel):
         status_groups = [self.good_statuses, self.bad_statuses, self.unresolved_statuses]
         if any(len(group) != len(set(group)) for group in status_groups):
             raise ValueError("status groups must not contain duplicate statuses")
+
+        if len(self.calibration_methods) != len(set(self.calibration_methods)):
+            raise ValueError("calibration methods must not contain duplicates")
 
         good_statuses = set(self.good_statuses)
         bad_statuses = set(self.bad_statuses)
