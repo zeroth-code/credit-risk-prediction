@@ -17,6 +17,8 @@ from sklearn.datasets import make_classification
 from sklearn.frozen import FrozenEstimator
 from sklearn.metrics import brier_score_loss
 
+from credit_risk.calibration import evaluate_calibration
+from credit_risk.costs import search_policy
 from credit_risk.features import load_feature_dictionary
 from credit_risk.training import (
     positive_class_weight,
@@ -400,6 +402,33 @@ def test_partition_target_rejects_values_that_would_be_truncated_to_binary() -> 
         )
 
 
+def test_calibration_loan_amounts_converts_numeric_values_without_modifying_frame() -> None:
+    train_script = _load_train_script("train_calibration_loan_amounts")
+    calibration = pd.DataFrame({"loan_amnt": pd.Series(["1000", " 2500.5 "], dtype="string")})
+    original = calibration.copy(deep=True)
+
+    amounts = train_script.calibration_loan_amounts(calibration)
+
+    np.testing.assert_array_equal(amounts, np.array([1000.0, 2500.5]))
+    pd.testing.assert_frame_equal(calibration, original)
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("not-a-number", "numeric"),
+        (np.nan, "finite"),
+        (np.inf, "finite"),
+        (-1.0, "nonnegative"),
+    ],
+)
+def test_calibration_loan_amounts_rejects_invalid_values(value: object, message: str) -> None:
+    train_script = _load_train_script("train_invalid_calibration_loan_amounts")
+
+    with pytest.raises(ValueError, match=f"calibration loan_amnt.*{message}"):
+        train_script.calibration_loan_amounts(pd.DataFrame({"loan_amnt": [value]}))
+
+
 def test_train_main_anchors_project_paths_when_called_from_another_working_directory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -407,19 +436,28 @@ def test_train_main_anchors_project_paths_when_called_from_another_working_direc
     project_root = train_script.PROJECT_ROOT
     observed: dict[str, Path] = {}
     saved_calibration_metrics: dict[str, object] = {}
+    saved_policy: dict[str, object] = {}
+    saved_sensitivity = pd.DataFrame()
+    costs = SimpleNamespace(
+        base=SimpleNamespace(lgd=0.6, margin=0.05, review_cost=30.0),
+        lgd_values=[0.4, 0.6, 0.8],
+        margin_values=[0.03, 0.05, 0.08],
+        review_cost_values=[15.0, 30.0, 60.0],
+    )
     config = SimpleNamespace(
         random_seed=47,
         processed_dir=Path("relative/processed"),
         artifact_dir=Path("relative/artifacts"),
         calibration_methods=["uncalibrated", "sigmoid", "isotonic"],
+        costs=costs,
     )
     feature_dictionary = {
-        "challenger": {"numeric": ["amount"], "categorical": ["purpose"]},
-        "full_underwriting": {"numeric": ["amount"], "categorical": ["grade"]},
+        "challenger": {"numeric": ["loan_amnt"], "categorical": ["purpose"]},
+        "full_underwriting": {"numeric": ["loan_amnt"], "categorical": ["grade"]},
     }
-    train = pd.DataFrame({"bad": [0, 0, 1, 1]})
-    validation = pd.DataFrame({"bad": [0, 1]})
-    calibration = pd.DataFrame({"bad": [0, 1]})
+    train = pd.DataFrame({"bad": [0, 0, 1, 1], "loan_amnt": [500, 600, 700, 800]})
+    validation = pd.DataFrame({"bad": [0, 1], "loan_amnt": [900, 1000]})
+    calibration = pd.DataFrame({"bad": [0, 1], "loan_amnt": [1000, 2000]})
 
     class FastPreprocessor:
         def transform(self, frame: pd.DataFrame) -> np.ndarray:
@@ -445,7 +483,7 @@ def test_train_main_anchors_project_paths_when_called_from_another_working_direc
         processed_dir: Path, required_columns: list[str]
     ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         observed["processed"] = processed_dir
-        assert required_columns == ["amount", "purpose", "grade"]
+        assert required_columns == ["loan_amnt", "purpose", "grade"]
         return train, validation, calibration
 
     def fake_build_feature_matrices(
@@ -467,8 +505,8 @@ def test_train_main_anchors_project_paths_when_called_from_another_working_direc
     ) -> pd.DataFrame:
         observed["calibration_build"] = Path(path)
         assert frame is calibration
-        assert columns == ["amount", "purpose"]
-        return pd.DataFrame({"amount": [0.0, 1.0], "purpose": ["a", "b"]})
+        assert columns == ["loan_amnt", "purpose"]
+        return pd.DataFrame({"loan_amnt": [1000.0, 2000.0], "purpose": ["a", "b"]})
 
     def fake_run_experiments(*args: object, **kwargs: object) -> list[dict[str, object]]:
         return [
@@ -513,6 +551,17 @@ def test_train_main_anchors_project_paths_when_called_from_another_working_direc
         observed["calibration_artifacts"] = artifact_dir
         saved_calibration_metrics.update(metrics_payload)
 
+    def fake_save_policy_artifacts(
+        artifact_dir: Path,
+        *,
+        policy_payload: dict[str, object],
+        sensitivity: pd.DataFrame,
+    ) -> None:
+        nonlocal saved_sensitivity
+        observed["policy_artifacts"] = artifact_dir
+        saved_policy.update(policy_payload)
+        saved_sensitivity = sensitivity.copy()
+
     monkeypatch.setattr(train_script, "load_config", fake_load_config)
     monkeypatch.setattr(train_script, "load_feature_dictionary", fake_load_feature_dictionary)
     monkeypatch.setattr(train_script, "load_partitions", fake_load_partitions)
@@ -525,8 +574,13 @@ def test_train_main_anchors_project_paths_when_called_from_another_working_direc
         lambda *args, **kwargs: SimpleNamespace(best_params={}),
     )
     monkeypatch.setattr(train_script, "make_lightgbm_model", lambda **kwargs: FastModel())
+    selected_probabilities = np.array([0.05, 0.95])
     evaluation = SimpleNamespace(
-        selection=SimpleNamespace(method="uncalibrated"),
+        selection=SimpleNamespace(method="sigmoid"),
+        probabilities={
+            "uncalibrated": np.array([0.4, 0.6]),
+            "sigmoid": selected_probabilities,
+        },
         metrics={
             "uncalibrated": {
                 "status": "evaluated",
@@ -535,7 +589,13 @@ def test_train_main_anchors_project_paths_when_called_from_another_working_direc
                 "log_loss": 0.2876820724517809,
                 "expected_calibration_error": 0.25,
             },
-            "sigmoid": {"status": "skipped", "skip_reason": "small sample"},
+            "sigmoid": {
+                "status": "evaluated",
+                "probability_source": "stratified_oof",
+                "brier_score": 0.0025,
+                "log_loss": 0.05129329438755058,
+                "expected_calibration_error": 0.05,
+            },
             "isotonic": {"status": "skipped", "skip_reason": "small sample"},
         },
         curve=pd.DataFrame(
@@ -549,16 +609,73 @@ def test_train_main_anchors_project_paths_when_called_from_another_working_direc
                 "observed_default_rate": [0.5],
             }
         ),
-        folds=0,
-        evaluation_protocol="base_model_holdout_only",
+        folds=2,
+        evaluation_protocol="stratified_oof",
     )
     monkeypatch.setattr(train_script, "evaluate_calibration", lambda *args, **kwargs: evaluation)
-    monkeypatch.setattr(train_script, "fit_calibrated_model", lambda model, *args, **kwargs: model)
+
+    class FullRefitArtifact:
+        def __init__(self) -> None:
+            self.predict_calls = 0
+
+        def predict_proba(self, features: object) -> np.ndarray:
+            self.predict_calls += 1
+            probabilities = np.array([0.95, 0.05])
+            return np.column_stack([1.0 - probabilities, probabilities])
+
+    full_refit_artifact = FullRefitArtifact()
+    monkeypatch.setattr(
+        train_script,
+        "fit_calibrated_model",
+        lambda model, *args, **kwargs: full_refit_artifact,
+    )
+    search_calls: list[dict[str, object]] = []
+
+    def fake_search_policy(
+        y_true: object,
+        loan_amount: object,
+        probabilities: object,
+        *,
+        lgd: float,
+        margin: float,
+        review_cost: float,
+    ) -> pd.DataFrame:
+        search_calls.append(
+            {
+                "y_true": np.asarray(y_true).copy(),
+                "loan_amount": np.asarray(loan_amount).copy(),
+                "probabilities": np.asarray(probabilities).copy(),
+                "lgd": lgd,
+                "margin": margin,
+                "review_cost": review_cost,
+            }
+        )
+        is_base_search = len(search_calls) == 1
+        return pd.DataFrame(
+            [
+                {
+                    "approve_below": 0.2 if is_base_search else 0.25,
+                    "decline_at": 0.7 if is_base_search else 0.75,
+                    "cost": 123.0 if is_base_search else 456.0,
+                    "approval_rate": 0.5,
+                    "review_rate": 0.0,
+                    "decline_rate": 0.5,
+                }
+            ]
+        )
+
+    monkeypatch.setattr(train_script, "search_policy", fake_search_policy, raising=False)
     monkeypatch.setattr(train_script, "save_training_artifacts", fake_save_training_artifacts)
     monkeypatch.setattr(
         train_script,
         "save_calibration_artifacts",
         fake_save_calibration_artifacts,
+    )
+    monkeypatch.setattr(
+        train_script,
+        "save_policy_artifacts",
+        fake_save_policy_artifacts,
+        raising=False,
     )
     monkeypatch.chdir(tmp_path)
 
@@ -572,9 +689,58 @@ def test_train_main_anchors_project_paths_when_called_from_another_working_direc
         "processed": project_root / "relative/processed",
         "artifacts": project_root / "relative/artifacts",
         "calibration_artifacts": project_root / "relative/artifacts",
+        "policy_artifacts": project_root / "relative/artifacts",
     }
-    assert saved_calibration_metrics["evaluation_protocol"] == "base_model_holdout_only"
-    assert saved_calibration_metrics["folds"] == 0
+    assert saved_calibration_metrics["evaluation_protocol"] == "stratified_oof"
+    assert saved_calibration_metrics["folds"] == 2
+    assert full_refit_artifact.predict_calls == 0
+    assert len(search_calls) == 28
+    for call in search_calls:
+        np.testing.assert_array_equal(call["y_true"], np.array([0, 1]))
+        np.testing.assert_array_equal(call["loan_amount"], np.array([1000.0, 2000.0]))
+        np.testing.assert_array_equal(call["probabilities"], selected_probabilities)
+    assert {(call["lgd"], call["margin"], call["review_cost"]) for call in search_calls[1:]} == {
+        (lgd, margin, review_cost)
+        for lgd in costs.lgd_values
+        for margin in costs.margin_values
+        for review_cost in costs.review_cost_values
+    }
+    assert saved_policy == {
+        "approve_below": 0.2,
+        "decline_at": 0.7,
+        "lgd": 0.6,
+        "margin": 0.05,
+        "review_cost": 30.0,
+        "calibration_cost": 123.0,
+        "calibration_approval_rate": 0.5,
+        "calibration_review_rate": 0.0,
+        "calibration_decline_rate": 0.5,
+        "selected_calibration_method": "sigmoid",
+        "probability_source": "stratified_oof",
+        "selection_partition": "calibration",
+        "threshold_selection_protocol": "grid_search_on_calibration_evaluation_probabilities",
+        "calibration_evaluation_protocol": "stratified_oof",
+    }
+    assert saved_sensitivity.columns.tolist() == [
+        "lgd",
+        "margin",
+        "review_cost",
+        "optimal_approve_below",
+        "optimal_decline_at",
+        "optimal_cost",
+        "optimal_approval_rate",
+        "optimal_review_rate",
+        "optimal_decline_rate",
+        "base_approve_below",
+        "base_decline_at",
+        "frozen_base_cost",
+        "frozen_base_approval_rate",
+        "frozen_base_review_rate",
+        "frozen_base_decline_rate",
+    ]
+    assert len(saved_sensitivity) == 27
+    assert (saved_sensitivity["optimal_approve_below"] == 0.25).all()
+    assert (saved_sensitivity["base_approve_below"] == 0.2).all()
 
 
 def test_train_main_writes_reproducible_calibrated_artifacts(
@@ -607,11 +773,18 @@ def test_train_main_writes_reproducible_calibrated_artifacts(
         calibration_path: calibration_path.read_bytes(),
         test_path: test_path.read_bytes(),
     }
+    costs = SimpleNamespace(
+        base=SimpleNamespace(lgd=0.6, margin=0.05, review_cost=30.0),
+        lgd_values=[0.4, 0.6, 0.8],
+        margin_values=[0.03, 0.05, 0.08],
+        review_cost_values=[15.0, 30.0, 60.0],
+    )
     config = SimpleNamespace(
         random_seed=43,
         processed_dir=processed_dir,
         artifact_dir=artifact_dir,
         calibration_methods=["uncalibrated", "sigmoid", "isotonic"],
+        costs=costs,
     )
     monkeypatch.setattr(train_script, "load_config", lambda path: config)
 
@@ -678,6 +851,8 @@ def test_train_main_writes_reproducible_calibrated_artifacts(
         "calibrated_model.joblib",
         "calibration_metrics.json",
         "calibration_curve.csv",
+        "policy.json",
+        "cost_sensitivity.csv",
     }
     assert {path.name for path in artifact_dir.iterdir()} == expected_artifacts
     model = joblib.load(artifact_dir / "uncalibrated_model.joblib")
@@ -690,6 +865,8 @@ def test_train_main_writes_reproducible_calibrated_artifacts(
         (artifact_dir / "calibration_metrics.json").read_text(encoding="utf-8")
     )
     calibration_curve = pd.read_csv(artifact_dir / "calibration_curve.csv")
+    policy = json.loads((artifact_dir / "policy.json").read_text(encoding="utf-8"))
+    cost_sensitivity = pd.read_csv(artifact_dir / "cost_sensitivity.csv")
     trials = pd.read_csv(artifact_dir / "tuning_trials.csv")
 
     assert read_partitions == ["train", "validation", "calibration"]
@@ -847,6 +1024,91 @@ def test_train_main_writes_reproducible_calibrated_artifacts(
         assert isinstance(calibrated_model, CalibratedClassifierCV)
         assert calibrated_model.method == selected_method
         assert isinstance(calibrated_model.estimator, FrozenEstimator)
+
+    expected_calibration_evaluation = evaluate_calibration(
+        model,
+        transformed_calibration,
+        calibration["bad"].to_numpy(),
+        methods=config.calibration_methods,
+        random_seed=config.random_seed,
+    )
+    expected_policy = search_policy(
+        calibration["bad"].to_numpy(),
+        calibration["loan_amnt"].to_numpy(),
+        expected_calibration_evaluation.probabilities[selected_method],
+        lgd=costs.base.lgd,
+        margin=costs.base.margin,
+        review_cost=costs.base.review_cost,
+    ).iloc[0]
+    assert policy == {
+        "approve_below": expected_policy["approve_below"],
+        "decline_at": expected_policy["decline_at"],
+        "lgd": costs.base.lgd,
+        "margin": costs.base.margin,
+        "review_cost": costs.base.review_cost,
+        "calibration_cost": expected_policy["cost"],
+        "calibration_approval_rate": expected_policy["approval_rate"],
+        "calibration_review_rate": expected_policy["review_rate"],
+        "calibration_decline_rate": expected_policy["decline_rate"],
+        "selected_calibration_method": selected_method,
+        "probability_source": expected_calibration_evaluation.metrics[selected_method][
+            "probability_source"
+        ],
+        "selection_partition": "calibration",
+        "threshold_selection_protocol": "grid_search_on_calibration_evaluation_probabilities",
+        "calibration_evaluation_protocol": expected_calibration_evaluation.evaluation_protocol,
+    }
+    assert cost_sensitivity.columns.tolist() == [
+        "lgd",
+        "margin",
+        "review_cost",
+        "optimal_approve_below",
+        "optimal_decline_at",
+        "optimal_cost",
+        "optimal_approval_rate",
+        "optimal_review_rate",
+        "optimal_decline_rate",
+        "base_approve_below",
+        "base_decline_at",
+        "frozen_base_cost",
+        "frozen_base_approval_rate",
+        "frozen_base_review_rate",
+        "frozen_base_decline_rate",
+    ]
+    assert len(cost_sensitivity) == 27
+    assert set(
+        cost_sensitivity[["lgd", "margin", "review_cost"]].itertuples(index=False, name=None)
+    ) == {
+        (lgd, margin, review_cost)
+        for lgd in costs.lgd_values
+        for margin in costs.margin_values
+        for review_cost in costs.review_cost_values
+    }
+    assert np.allclose(
+        cost_sensitivity[
+            ["optimal_approval_rate", "optimal_review_rate", "optimal_decline_rate"]
+        ].sum(axis=1),
+        1.0,
+    )
+    assert np.allclose(
+        cost_sensitivity[
+            [
+                "frozen_base_approval_rate",
+                "frozen_base_review_rate",
+                "frozen_base_decline_rate",
+            ]
+        ].sum(axis=1),
+        1.0,
+    )
+    base_scenario = cost_sensitivity[
+        (cost_sensitivity["lgd"] == costs.base.lgd)
+        & (cost_sensitivity["margin"] == costs.base.margin)
+        & (cost_sensitivity["review_cost"] == costs.base.review_cost)
+    ].iloc[0]
+    assert base_scenario["optimal_approve_below"] == pytest.approx(policy["approve_below"])
+    assert base_scenario["optimal_decline_at"] == pytest.approx(policy["decline_at"])
+    assert base_scenario["optimal_cost"] == pytest.approx(policy["calibration_cost"])
+    assert base_scenario["frozen_base_cost"] == pytest.approx(policy["calibration_cost"])
     assert set(trials.columns) >= {
         "number",
         "value",

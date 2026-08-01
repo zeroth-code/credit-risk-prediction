@@ -1,6 +1,7 @@
 import argparse
 import json
 import sys
+from itertools import product
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -17,7 +18,8 @@ from credit_risk.calibration import (  # noqa: E402
     evaluate_calibration,
     fit_calibrated_model,
 )
-from credit_risk.config import load_config  # noqa: E402
+from credit_risk.config import CostConfig, load_config  # noqa: E402
+from credit_risk.costs import assign_actions, policy_cost, search_policy  # noqa: E402
 from credit_risk.features import (  # noqa: E402
     build_feature_frame,
     feature_columns,
@@ -47,6 +49,23 @@ FEATURE_SETS = ("challenger", "full_underwriting")
 CHALLENGER_LIGHTGBM_STRATEGIES = ("natural", "weighted", "undersampled")
 BASE_CONFIG_PATH = _project_path("configs/base.yaml")
 FEATURE_DICTIONARY_PATH = _project_path("configs/features.yaml")
+COST_SENSITIVITY_COLUMNS = [
+    "lgd",
+    "margin",
+    "review_cost",
+    "optimal_approve_below",
+    "optimal_decline_at",
+    "optimal_cost",
+    "optimal_approval_rate",
+    "optimal_review_rate",
+    "optimal_decline_rate",
+    "base_approve_below",
+    "base_decline_at",
+    "frozen_base_cost",
+    "frozen_base_approval_rate",
+    "frozen_base_review_rate",
+    "frozen_base_decline_rate",
+]
 
 
 def required_feature_columns(feature_dictionary: dict[str, object]) -> list[str]:
@@ -82,6 +101,19 @@ def partition_target(frame: pd.DataFrame, *, partition_name: str) -> np.ndarray:
     except ValueError as exc:
         raise ValueError(f"{partition_name} bad target invalid: {exc}") from exc
     return target.astype(int, copy=False)
+
+
+def calibration_loan_amounts(frame: pd.DataFrame) -> np.ndarray:
+    try:
+        numeric = pd.to_numeric(frame["loan_amnt"], errors="raise")
+        amounts = np.asarray(numeric, dtype=float)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("calibration loan_amnt must contain numeric values") from exc
+    if not np.isfinite(amounts).all():
+        raise ValueError("calibration loan_amnt must contain only finite values")
+    if not (amounts >= 0.0).all():
+        raise ValueError("calibration loan_amnt must contain only nonnegative values")
+    return amounts
 
 
 def build_feature_matrices(
@@ -327,6 +359,120 @@ def save_calibration_artifacts(
     )
 
 
+def build_policy_artifacts(
+    y_true: np.ndarray,
+    loan_amount: np.ndarray,
+    probabilities: np.ndarray,
+    *,
+    costs: CostConfig,
+    selected_method: str,
+    probability_source: str,
+    calibration_evaluation_protocol: str,
+) -> tuple[dict[str, object], pd.DataFrame]:
+    base = costs.base
+    base_search = search_policy(
+        y_true,
+        loan_amount,
+        probabilities,
+        lgd=base.lgd,
+        margin=base.margin,
+        review_cost=base.review_cost,
+    )
+    base_policy = base_search.iloc[0]
+    approve_below = float(base_policy["approve_below"])
+    decline_at = float(base_policy["decline_at"])
+    frozen_actions = assign_actions(
+        probabilities,
+        approve_below=approve_below,
+        decline_at=decline_at,
+    )
+    frozen_rates = {
+        "approval_rate": float(np.mean(frozen_actions == "approve")),
+        "review_rate": float(np.mean(frozen_actions == "manual_review")),
+        "decline_rate": float(np.mean(frozen_actions == "decline")),
+    }
+    policy_payload: dict[str, object] = {
+        "approve_below": approve_below,
+        "decline_at": decline_at,
+        "lgd": float(base.lgd),
+        "margin": float(base.margin),
+        "review_cost": float(base.review_cost),
+        "calibration_cost": float(base_policy["cost"]),
+        "calibration_approval_rate": float(base_policy["approval_rate"]),
+        "calibration_review_rate": float(base_policy["review_rate"]),
+        "calibration_decline_rate": float(base_policy["decline_rate"]),
+        "selected_calibration_method": selected_method,
+        "probability_source": probability_source,
+        "selection_partition": "calibration",
+        "threshold_selection_protocol": "grid_search_on_calibration_evaluation_probabilities",
+        "calibration_evaluation_protocol": calibration_evaluation_protocol,
+    }
+
+    sensitivity_rows: list[dict[str, float]] = []
+    scenarios = product(
+        costs.lgd_values,
+        costs.margin_values,
+        costs.review_cost_values,
+    )
+    for lgd, margin, review_cost in scenarios:
+        scenario_search = search_policy(
+            y_true,
+            loan_amount,
+            probabilities,
+            lgd=lgd,
+            margin=margin,
+            review_cost=review_cost,
+        )
+        optimal = scenario_search.iloc[0]
+        sensitivity_rows.append(
+            {
+                "lgd": float(lgd),
+                "margin": float(margin),
+                "review_cost": float(review_cost),
+                "optimal_approve_below": float(optimal["approve_below"]),
+                "optimal_decline_at": float(optimal["decline_at"]),
+                "optimal_cost": float(optimal["cost"]),
+                "optimal_approval_rate": float(optimal["approval_rate"]),
+                "optimal_review_rate": float(optimal["review_rate"]),
+                "optimal_decline_rate": float(optimal["decline_rate"]),
+                "base_approve_below": approve_below,
+                "base_decline_at": decline_at,
+                "frozen_base_cost": policy_cost(
+                    y_true,
+                    loan_amount,
+                    frozen_actions,
+                    lgd=lgd,
+                    margin=margin,
+                    review_cost=review_cost,
+                ),
+                "frozen_base_approval_rate": frozen_rates["approval_rate"],
+                "frozen_base_review_rate": frozen_rates["review_rate"],
+                "frozen_base_decline_rate": frozen_rates["decline_rate"],
+            }
+        )
+    sensitivity = pd.DataFrame.from_records(
+        sensitivity_rows,
+        columns=COST_SENSITIVITY_COLUMNS,
+    )
+    return policy_payload, sensitivity
+
+
+def save_policy_artifacts(
+    artifact_dir: Path,
+    *,
+    policy_payload: dict[str, object],
+    sensitivity: pd.DataFrame,
+) -> None:
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    with (artifact_dir / "policy.json").open("w", encoding="utf-8") as file:
+        json.dump(_json_native(policy_payload), file, ensure_ascii=False, indent=2)
+    sensitivity.to_csv(
+        artifact_dir / "cost_sensitivity.csv",
+        index=False,
+        encoding="utf-8",
+    )
+
+
 def main(n_trials: int = 30) -> None:
     if not isinstance(n_trials, int) or isinstance(n_trials, bool) or n_trials <= 0:
         raise ValueError("n_trials must be a positive int and must not be a bool")
@@ -402,6 +548,16 @@ def main(n_trials: int = 30) -> None:
         random_seed=config.random_seed,
     )
     selected_method = calibration_evaluation.selection.method
+    selected_method_metrics = calibration_evaluation.metrics[selected_method]
+    policy_payload, cost_sensitivity = build_policy_artifacts(
+        y_calibration,
+        calibration_loan_amounts(calibration),
+        calibration_evaluation.probabilities[selected_method],
+        costs=config.costs,
+        selected_method=selected_method,
+        probability_source=str(selected_method_metrics["probability_source"]),
+        calibration_evaluation_protocol=calibration_evaluation.evaluation_protocol,
+    )
     calibrated_model = fit_calibrated_model(
         final_model,
         calibration_matrix,
@@ -455,6 +611,11 @@ def main(n_trials: int = 30) -> None:
         calibrated_model=calibrated_model,
         metrics_payload=calibration_metrics_payload,
         curve=calibration_evaluation.curve,
+    )
+    save_policy_artifacts(
+        artifact_dir,
+        policy_payload=policy_payload,
+        sensitivity=cost_sensitivity,
     )
 
 
