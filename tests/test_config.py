@@ -30,7 +30,7 @@ def _project_config_payload() -> dict[str, object]:
         "good_statuses": ["Fully Paid"],
         "bad_statuses": ["Charged Off", "Default"],
         "unresolved_statuses": ["Current"],
-        "calibration_methods": ["sigmoid"],
+        "calibration_methods": ["uncalibrated", "sigmoid", "isotonic"],
         "minimum_group_size": 200,
         "costs": _cost_config_payload(),
     }
@@ -186,6 +186,25 @@ def test_project_config_rejects_invalid_calibration_methods(methods: list[str]) 
     payload["calibration_methods"] = methods
 
     with pytest.raises(ValidationError):
+        ProjectConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    "methods",
+    [
+        ["uncalibrated"],
+        ["sigmoid"],
+        ["isotonic"],
+        ["uncalibrated", "sigmoid"],
+        ["uncalibrated", "isotonic"],
+        ["sigmoid", "isotonic"],
+    ],
+)
+def test_project_config_requires_all_calibration_methods(methods: list[str]) -> None:
+    payload = _project_config_payload()
+    payload["calibration_methods"] = methods
+
+    with pytest.raises(ValidationError, match="calibration methods must contain exactly"):
         ProjectConfig.model_validate(payload)
 
 

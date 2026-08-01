@@ -79,8 +79,14 @@ class ProjectConfig(ConfigModel):
         if any(len(group) != len(set(group)) for group in status_groups):
             raise ValueError("status groups must not contain duplicate statuses")
 
-        if len(self.calibration_methods) != len(set(self.calibration_methods)):
-            raise ValueError("calibration methods must not contain duplicates")
+        required_calibration_methods = {"uncalibrated", "sigmoid", "isotonic"}
+        if (
+            len(self.calibration_methods) != len(required_calibration_methods)
+            or set(self.calibration_methods) != required_calibration_methods
+        ):
+            raise ValueError(
+                "calibration methods must contain exactly uncalibrated, sigmoid, and isotonic"
+            )
 
         good_statuses = set(self.good_statuses)
         bad_statuses = set(self.bad_statuses)

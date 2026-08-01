@@ -4,10 +4,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import pytest
-from sklearn.calibration import CalibratedClassifierCV
 from sklearn.frozen import FrozenEstimator
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import brier_score_loss
 
+import credit_risk.calibration as calibration_module
 from credit_risk.calibration import expected_calibration_error, select_calibration
 
 
@@ -147,9 +148,7 @@ def test_load_partitions_reads_calibration_without_reading_test(
 
 
 def test_calibration_curve_frame_represents_empty_bins_and_probability_one() -> None:
-    train_script = _load_train_script("train_calibration_curve")
-
-    curve = train_script.calibration_curve_frame(
+    curve = calibration_module.calibration_curve_frame(
         np.array([0, 1]),
         {"uncalibrated": np.array([0.0, 1.0])},
         bins=3,
@@ -176,48 +175,243 @@ def test_calibration_curve_frame_represents_empty_bins_and_probability_one() -> 
     assert curve.loc[2, "observed_default_rate"] == pytest.approx(1.0)
 
 
-def test_fit_calibration_candidates_freezes_fitted_model() -> None:
-    train_script = _load_train_script("train_fit_calibration")
-    x_train = np.array([[-2.0], [-1.0], [1.0], [2.0]])
-    y_train = np.array([0, 0, 1, 1])
-    x_calibration = np.linspace(-2.0, 2.0, 10).reshape(-1, 1)
-    y_calibration = np.array([0, 0, 0, 0, 0, 1, 1, 1, 1, 1])
-    model = LogisticRegression(random_state=13).fit(x_train, y_train)
-    coefficients_before = model.coef_.copy()
+class _RowProbabilityModel:
+    def __init__(self, split: int, low: float = 0.4, high: float = 0.6) -> None:
+        self.split = split
+        self.low = low
+        self.high = high
 
-    estimators, candidates = train_script.fit_calibration_candidates(
-        model,
-        x_calibration,
-        y_calibration,
-        methods=["uncalibrated", "sigmoid", "isotonic"],
-    )
-
-    assert list(estimators) == ["uncalibrated", "sigmoid", "isotonic"]
-    assert list(candidates) == ["uncalibrated", "sigmoid", "isotonic"]
-    assert estimators["uncalibrated"] is model
-    for method in ("sigmoid", "isotonic"):
-        calibrated = estimators[method]
-        assert isinstance(calibrated, CalibratedClassifierCV)
-        assert isinstance(calibrated.estimator, FrozenEstimator)
-        assert calibrated.estimator.estimator is model
-        probabilities = candidates[method]
-        assert probabilities.shape == (len(y_calibration),)
-        assert np.isfinite(probabilities).all()
-        assert ((probabilities >= 0.0) & (probabilities <= 1.0)).all()
-    np.testing.assert_array_equal(model.coef_, coefficients_before)
+    def predict_proba(self, features: object) -> np.ndarray:
+        row_ids = np.asarray(features)[:, 0].astype(int)
+        probabilities = np.where(row_ids < self.split, self.low, self.high)
+        return np.column_stack([1.0 - probabilities, probabilities])
 
 
-def test_fit_calibration_candidates_requires_all_configured_methods() -> None:
-    train_script = _load_train_script("train_missing_calibration_method")
-    model = LogisticRegression().fit(
-        np.array([[-1.0], [1.0]]),
-        np.array([0, 1]),
-    )
+class _RecordingCalibrator:
+    fit_records: list[tuple[str, set[int]]] = []
+    predict_records: list[tuple[str, set[int], list[int]]] = []
 
-    with pytest.raises(ValueError, match="missing required calibration methods: isotonic"):
-        train_script.fit_calibration_candidates(
-            model,
-            np.array([[-0.5], [0.5]]),
-            np.array([0, 1]),
-            methods=["uncalibrated", "sigmoid"],
+    def __init__(self, estimator: object, *, method: str, cv: object) -> None:
+        self.estimator = estimator
+        self.method = method
+        self.cv = cv
+        self.labels: dict[int, int] = {}
+
+    def fit(self, features: object, target: np.ndarray) -> "_RecordingCalibrator":
+        row_ids = np.asarray(features)[:, 0].astype(int)
+        self.labels = dict(
+            zip(row_ids.tolist(), np.asarray(target).astype(int).tolist(), strict=True)
         )
+        self.fit_records.append((self.method, set(row_ids.tolist())))
+        return self
+
+    def predict_proba(self, features: object) -> np.ndarray:
+        row_ids = np.asarray(features)[:, 0].astype(int)
+        self.predict_records.append((self.method, set(self.labels), row_ids.tolist()))
+        if self.method == "isotonic":
+            probabilities = np.array([self.labels.get(row_id, 0.5) for row_id in row_ids])
+        else:
+            probabilities = np.where(row_ids < 10, 0.2, 0.8)
+        return np.column_stack([1.0 - probabilities, probabilities])
+
+
+class _PassThroughCalibrator:
+    def __init__(self, estimator: object, *, method: str, cv: object) -> None:
+        self.estimator = estimator
+        self.method = method
+        self.cv = cv
+
+    def fit(self, features: object, target: np.ndarray) -> "_PassThroughCalibrator":
+        return self
+
+    def predict_proba(self, features: object) -> np.ndarray:
+        return self.estimator.predict_proba(features)  # type: ignore[attr-defined,no-any-return]
+
+
+def test_evaluate_calibration_uses_oof_probabilities_for_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _RecordingCalibrator.fit_records = []
+    _RecordingCalibrator.predict_records = []
+    monkeypatch.setattr(
+        calibration_module,
+        "CalibratedClassifierCV",
+        _RecordingCalibrator,
+        raising=False,
+    )
+    monkeypatch.setattr(calibration_module, "MIN_ISOTONIC_SAMPLES", 20, raising=False)
+    monkeypatch.setattr(calibration_module, "MIN_ISOTONIC_CLASS_COUNT", 10, raising=False)
+    features = np.arange(20, dtype=float).reshape(-1, 1)
+    target = np.array([0] * 10 + [1] * 10)
+    base_model = _RowProbabilityModel(split=10)
+
+    evaluation = calibration_module.evaluate_calibration(
+        base_model,
+        features,
+        target,
+        methods=["uncalibrated", "sigmoid", "isotonic"],
+        random_seed=23,
+    )
+
+    assert evaluation.selection.method == "sigmoid"
+    assert evaluation.folds == 5
+    assert evaluation.metrics["sigmoid"]["brier_score"] == pytest.approx(0.04)
+    assert evaluation.metrics["isotonic"]["brier_score"] == pytest.approx(0.25)
+    assert np.all(evaluation.probabilities["isotonic"] == 0.5)
+    assert evaluation.curve["method"].drop_duplicates().tolist() == [
+        "uncalibrated",
+        "sigmoid",
+        "isotonic",
+    ]
+
+    for method in ("sigmoid", "isotonic"):
+        records = [record for record in _RecordingCalibrator.predict_records if record[0] == method]
+        predicted_rows = [row_id for _, _, row_ids in records for row_id in row_ids]
+        assert sorted(predicted_rows) == list(range(len(target)))
+        assert len(predicted_rows) == len(set(predicted_rows))
+        assert all(train_rows.isdisjoint(holdout_rows) for _, train_rows, holdout_rows in records)
+
+    full_isotonic = _RecordingCalibrator(
+        FrozenEstimator(base_model),
+        method="isotonic",
+        cv=None,
+    ).fit(features, target)
+    full_fit_probabilities = full_isotonic.predict_proba(features)[:, 1]
+    assert brier_score_loss(target, full_fit_probabilities) == pytest.approx(0.0)
+    assert evaluation.selection.method != "isotonic"
+
+
+def test_evaluate_calibration_is_reproducible_and_does_not_modify_base_model() -> None:
+    train_features = np.array([[-3.0], [-2.0], [-1.0], [1.0], [2.0], [3.0]])
+    train_target = np.array([0, 0, 0, 1, 1, 1])
+    features = np.linspace(-4.0, 4.0, 40).reshape(-1, 1)
+    target = (features[:, 0] >= 0.0).astype(int)
+    base_model = LogisticRegression(random_state=11).fit(train_features, train_target)
+    coefficients_before = base_model.coef_.copy()
+
+    first = calibration_module.evaluate_calibration(
+        base_model,
+        features,
+        target,
+        methods=["uncalibrated", "sigmoid", "isotonic"],
+        random_seed=29,
+    )
+    second = calibration_module.evaluate_calibration(
+        base_model,
+        features,
+        target,
+        methods=["uncalibrated", "sigmoid", "isotonic"],
+        random_seed=29,
+    )
+
+    assert first.folds == 5
+    np.testing.assert_array_equal(first.probabilities["sigmoid"], second.probabilities["sigmoid"])
+    assert np.isfinite(first.probabilities["sigmoid"]).all()
+    np.testing.assert_array_equal(base_model.coef_, coefficients_before)
+
+
+def test_evaluate_calibration_skips_fitted_methods_when_minority_class_is_one() -> None:
+    features = np.arange(4, dtype=float).reshape(-1, 1)
+    target = np.array([0, 0, 0, 1])
+
+    evaluation = calibration_module.evaluate_calibration(
+        _RowProbabilityModel(split=3),
+        features,
+        target,
+        methods=["uncalibrated", "sigmoid", "isotonic"],
+        random_seed=31,
+    )
+
+    assert evaluation.folds == 1
+    assert evaluation.selection.method == "uncalibrated"
+    assert list(evaluation.probabilities) == ["uncalibrated"]
+    assert evaluation.curve["method"].drop_duplicates().tolist() == ["uncalibrated"]
+    assert evaluation.metrics["uncalibrated"]["status"] == "evaluated"
+    for method in ("sigmoid", "isotonic"):
+        assert evaluation.metrics[method]["status"] == "skipped"
+        assert "at least 2 samples in each class" in evaluation.metrics[method]["skip_reason"]
+
+
+@pytest.mark.parametrize(
+    ("rows", "positives", "expected_status", "reason"),
+    [
+        (999, 50, "skipped", "at least 1000 calibration samples"),
+        (1000, 49, "skipped", "at least 50 samples in each class"),
+        (1000, 50, "evaluated", None),
+    ],
+)
+def test_evaluate_calibration_applies_isotonic_sample_thresholds(
+    rows: int,
+    positives: int,
+    expected_status: str,
+    reason: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        calibration_module,
+        "CalibratedClassifierCV",
+        _PassThroughCalibrator,
+        raising=False,
+    )
+    features = np.arange(rows, dtype=float).reshape(-1, 1)
+    target = np.array([0] * (rows - positives) + [1] * positives)
+
+    evaluation = calibration_module.evaluate_calibration(
+        _RowProbabilityModel(split=rows - positives, low=0.1, high=0.9),
+        features,
+        target,
+        methods=["uncalibrated", "sigmoid", "isotonic"],
+        random_seed=37,
+    )
+
+    assert evaluation.metrics["isotonic"]["status"] == expected_status
+    if reason is None:
+        assert "skip_reason" not in evaluation.metrics["isotonic"]
+        assert "isotonic" in evaluation.probabilities
+    else:
+        assert reason in evaluation.metrics["isotonic"]["skip_reason"]
+        assert "isotonic" not in evaluation.probabilities
+
+
+def test_fit_calibrated_model_refits_selected_method_on_full_calibration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _RecordingCalibrator.fit_records = []
+    monkeypatch.setattr(
+        calibration_module,
+        "CalibratedClassifierCV",
+        _RecordingCalibrator,
+        raising=False,
+    )
+    features = np.arange(20, dtype=float).reshape(-1, 1)
+    target = np.array([0] * 10 + [1] * 10)
+    base_model = _RowProbabilityModel(split=10)
+
+    calibrated = calibration_module.fit_calibrated_model(
+        base_model,
+        features,
+        target,
+        method="sigmoid",
+    )
+
+    assert isinstance(calibrated, _RecordingCalibrator)
+    assert calibrated.method == "sigmoid"
+    assert isinstance(calibrated.estimator, FrozenEstimator)
+    assert calibrated.estimator.estimator is base_model
+    assert _RecordingCalibrator.fit_records == [("sigmoid", set(range(20)))]
+    train_indices, predict_indices = calibrated.cv[0]
+    np.testing.assert_array_equal(train_indices, np.arange(20))
+    np.testing.assert_array_equal(predict_indices, np.arange(20))
+
+
+def test_fit_calibrated_model_returns_base_model_for_uncalibrated() -> None:
+    base_model = _RowProbabilityModel(split=2)
+
+    result = calibration_module.fit_calibrated_model(
+        base_model,
+        np.arange(4, dtype=float).reshape(-1, 1),
+        np.array([0, 0, 1, 1]),
+        method="uncalibrated",
+    )
+
+    assert result is base_model

@@ -12,7 +12,9 @@ import numpy as np
 import optuna
 import pandas as pd
 import pytest
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.datasets import make_classification
+from sklearn.frozen import FrozenEstimator
 from sklearn.metrics import brier_score_loss
 
 from credit_risk.features import load_feature_dictionary
@@ -521,14 +523,34 @@ def test_train_main_anchors_project_paths_when_called_from_another_working_direc
         lambda *args, **kwargs: SimpleNamespace(best_params={}),
     )
     monkeypatch.setattr(train_script, "make_lightgbm_model", lambda **kwargs: FastModel())
-    monkeypatch.setattr(
-        train_script,
-        "fit_calibration_candidates",
-        lambda *args, **kwargs: (
-            {method: args[0] for method in config.calibration_methods},
-            {method: np.array([0.25, 0.75]) for method in config.calibration_methods},
+    evaluation = SimpleNamespace(
+        selection=SimpleNamespace(method="uncalibrated"),
+        metrics={
+            "uncalibrated": {
+                "status": "evaluated",
+                "probability_source": "base_model_calibration_partition",
+                "brier_score": 0.0625,
+                "log_loss": 0.2876820724517809,
+                "expected_calibration_error": 0.25,
+            },
+            "sigmoid": {"status": "skipped", "skip_reason": "small sample"},
+            "isotonic": {"status": "skipped", "skip_reason": "small sample"},
+        },
+        curve=pd.DataFrame(
+            {
+                "method": ["uncalibrated"],
+                "bin_index": [0],
+                "bin_lower": [0.0],
+                "bin_upper": [1.0],
+                "sample_count": [2],
+                "mean_probability": [0.5],
+                "observed_default_rate": [0.5],
+            }
         ),
+        folds=0,
     )
+    monkeypatch.setattr(train_script, "evaluate_calibration", lambda *args, **kwargs: evaluation)
+    monkeypatch.setattr(train_script, "fit_calibrated_model", lambda model, *args, **kwargs: model)
     monkeypatch.setattr(train_script, "save_training_artifacts", fake_save_training_artifacts)
     monkeypatch.setattr(
         train_script,
@@ -668,19 +690,47 @@ def test_train_main_writes_reproducible_calibrated_artifacts(
     assert read_partitions == ["train", "validation", "calibration"]
     assert calibration_metrics["calibration_samples"] == len(calibration)
     assert calibration_metrics["calibration_prevalence"] == pytest.approx(calibration["bad"].mean())
+    assert calibration_metrics["evaluation_protocol"] == "stratified_oof"
+    assert calibration_metrics["evaluation_partition"] == "calibration"
+    assert calibration_metrics["folds"] == 5
+    assert calibration_metrics["random_seed"] == 43
     assert list(calibration_metrics["methods"]) == config.calibration_methods
-    for method_metrics in calibration_metrics["methods"].values():
+    for method in ("uncalibrated", "sigmoid"):
+        method_metrics = calibration_metrics["methods"][method]
         assert set(method_metrics) == {
+            "status",
+            "probability_source",
             "brier_score",
             "log_loss",
             "expected_calibration_error",
         }
-        assert all(np.isfinite(value) for value in method_metrics.values())
+        assert all(
+            np.isfinite(method_metrics[key])
+            for key in ("brier_score", "log_loss", "expected_calibration_error")
+        )
+    assert calibration_metrics["methods"]["isotonic"]["status"] == "skipped"
+    assert (
+        "at least 1000 calibration samples"
+        in calibration_metrics["methods"]["isotonic"]["skip_reason"]
+    )
     selected_method = calibration_metrics["selected_method"]
     assert selected_method == min(
-        config.calibration_methods,
+        ["uncalibrated", "sigmoid"],
         key=lambda method: calibration_metrics["methods"][method]["brier_score"],
     )
+    assert calibration_metrics["artifact"]["method"] == selected_method
+    if selected_method == "uncalibrated":
+        assert calibration_metrics["artifact"] == {
+            "method": "uncalibrated",
+            "fit_protocol": "base_model_train_fit",
+            "fit_partition": "train",
+        }
+    else:
+        assert calibration_metrics["artifact"] == {
+            "method": selected_method,
+            "fit_protocol": "full_calibration_refit",
+            "fit_partition": "calibration",
+        }
     assert calibration_curve.columns.tolist() == [
         "method",
         "bin_index",
@@ -690,10 +740,11 @@ def test_train_main_writes_reproducible_calibrated_artifacts(
         "mean_probability",
         "observed_default_rate",
     ]
-    assert len(calibration_curve) == 10 * len(config.calibration_methods)
-    assert calibration_curve["method"].drop_duplicates().tolist() == config.calibration_methods
+    evaluated_methods = ["uncalibrated", "sigmoid"]
+    assert len(calibration_curve) == 10 * len(evaluated_methods)
+    assert calibration_curve["method"].drop_duplicates().tolist() == evaluated_methods
     assert calibration_curve.groupby("method", sort=False)["sample_count"].sum().to_dict() == {
-        method: len(calibration) for method in config.calibration_methods
+        method: len(calibration) for method in evaluated_methods
     }
 
     assert metrics_payload["primary_feature_set"] == "challenger"
@@ -783,9 +834,14 @@ def test_train_main_writes_reproducible_calibrated_artifacts(
     calibrated_probabilities = calibrated_model.predict_proba(transformed_calibration)[:, 1]
     assert calibrated_probabilities.shape == (len(calibration),)
     assert np.isfinite(calibrated_probabilities).all()
-    assert brier_score_loss(calibration["bad"], calibrated_probabilities) == pytest.approx(
-        calibration_metrics["methods"][selected_method]["brier_score"]
-    )
+    if selected_method == "uncalibrated":
+        assert brier_score_loss(calibration["bad"], calibrated_probabilities) == pytest.approx(
+            calibration_metrics["methods"][selected_method]["brier_score"]
+        )
+    else:
+        assert isinstance(calibrated_model, CalibratedClassifierCV)
+        assert calibrated_model.method == selected_method
+        assert isinstance(calibrated_model.estimator, FrozenEstimator)
     assert set(trials.columns) >= {
         "number",
         "value",
