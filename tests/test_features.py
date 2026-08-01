@@ -1,5 +1,8 @@
+from pathlib import Path
+
 import pandas as pd
 import pytest
+import yaml
 
 from credit_risk.features import (
     build_feature_frame,
@@ -46,6 +49,23 @@ POST_ORIGINATION = [
 ]
 
 
+def _valid_feature_dictionary_payload() -> dict[str, object]:
+    return {
+        "challenger": {"numeric": ["loan_amnt"], "categorical": ["purpose"]},
+        "full_underwriting": {
+            "numeric": ["loan_amnt", "int_rate"],
+            "categorical": ["purpose", "grade"],
+        },
+        "post_origination": ["recoveries"],
+    }
+
+
+def _write_feature_dictionary(tmp_path: Path, payload: object) -> Path:
+    path = tmp_path / "features.yaml"
+    path.write_text(yaml.safe_dump(payload), encoding="utf-8")
+    return path
+
+
 def test_prohibited_columns_include_post_origination_leakage() -> None:
     blocked = prohibited_columns()
 
@@ -83,6 +103,27 @@ def test_build_feature_frame_reports_all_missing_columns() -> None:
     assert "purpose" in str(error.value)
 
 
+def test_build_feature_frame_rejects_empty_selection() -> None:
+    frame = pd.DataFrame({"loan_amnt": [10_000]})
+
+    with pytest.raises(ValueError, match="at least one|empty"):
+        build_feature_frame(frame, [])
+
+
+def test_build_feature_frame_rejects_duplicate_columns() -> None:
+    frame = pd.DataFrame({"loan_amnt": [10_000], "purpose": ["credit_card"]})
+
+    with pytest.raises(ValueError, match="duplicate.*loan_amnt|loan_amnt.*duplicate"):
+        build_feature_frame(frame, ["loan_amnt", "purpose", "loan_amnt"])
+
+
+def test_build_feature_frame_checks_duplicates_before_prohibited_columns() -> None:
+    frame = pd.DataFrame({"recoveries": [100]})
+
+    with pytest.raises(ValueError, match="duplicate.*recoveries|recoveries.*duplicate"):
+        build_feature_frame(frame, ["recoveries", "recoveries"])
+
+
 def test_build_feature_frame_preserves_selection_order_and_returns_a_copy() -> None:
     frame = pd.DataFrame(
         {"loan_amnt": [10_000], "annual_inc": [60_000], "purpose": ["credit_card"]}
@@ -106,6 +147,136 @@ def test_load_feature_dictionary_returns_configured_feature_sets() -> None:
             "categorical": [*CHALLENGER_CATEGORICAL, "grade", "sub_grade"],
         },
         "post_origination": POST_ORIGINATION,
+    }
+
+
+def test_load_feature_dictionary_rejects_scalar_post_origination(tmp_path: Path) -> None:
+    payload = _valid_feature_dictionary_payload()
+    payload["post_origination"] = "recoveries"
+    path = _write_feature_dictionary(tmp_path, payload)
+
+    with pytest.raises(ValueError, match="post_origination"):
+        load_feature_dictionary(path)
+
+
+def test_load_feature_dictionary_rejects_missing_top_level_section(tmp_path: Path) -> None:
+    payload = _valid_feature_dictionary_payload()
+    del payload["full_underwriting"]
+    path = _write_feature_dictionary(tmp_path, payload)
+
+    with pytest.raises(ValueError, match="full_underwriting"):
+        load_feature_dictionary(path)
+
+
+def test_load_feature_dictionary_rejects_unknown_top_level_key(tmp_path: Path) -> None:
+    payload = _valid_feature_dictionary_payload()
+    payload["unexpected"] = ["value"]
+    path = _write_feature_dictionary(tmp_path, payload)
+
+    with pytest.raises(ValueError, match="unexpected"):
+        load_feature_dictionary(path)
+
+
+def test_load_feature_dictionary_rejects_missing_section_list(tmp_path: Path) -> None:
+    payload = _valid_feature_dictionary_payload()
+    del payload["challenger"]["categorical"]
+    path = _write_feature_dictionary(tmp_path, payload)
+
+    with pytest.raises(ValueError, match="categorical"):
+        load_feature_dictionary(path)
+
+
+def test_load_feature_dictionary_rejects_unknown_section_key(tmp_path: Path) -> None:
+    payload = _valid_feature_dictionary_payload()
+    payload["challenger"]["unexpected"] = ["value"]
+    path = _write_feature_dictionary(tmp_path, payload)
+
+    with pytest.raises(ValueError, match="unexpected"):
+        load_feature_dictionary(path)
+
+
+def test_load_feature_dictionary_rejects_scalar_section_list(tmp_path: Path) -> None:
+    payload = _valid_feature_dictionary_payload()
+    payload["challenger"]["numeric"] = "loan_amnt"
+    path = _write_feature_dictionary(tmp_path, payload)
+
+    with pytest.raises(ValueError, match="numeric"):
+        load_feature_dictionary(path)
+
+
+def test_load_feature_dictionary_rejects_empty_lists(tmp_path: Path) -> None:
+    payload = _valid_feature_dictionary_payload()
+    payload["challenger"]["numeric"] = []
+    payload["post_origination"] = []
+    path = _write_feature_dictionary(tmp_path, payload)
+
+    with pytest.raises(ValueError) as error:
+        load_feature_dictionary(path)
+
+    assert "numeric" in str(error.value)
+    assert "post_origination" in str(error.value)
+
+
+def test_load_feature_dictionary_rejects_blank_and_non_string_items(tmp_path: Path) -> None:
+    payload = _valid_feature_dictionary_payload()
+    payload["challenger"]["numeric"] = ["   "]
+    payload["post_origination"] = [123]
+    path = _write_feature_dictionary(tmp_path, payload)
+
+    with pytest.raises(ValueError) as error:
+        load_feature_dictionary(path)
+
+    assert "numeric" in str(error.value)
+    assert "post_origination" in str(error.value)
+
+
+def test_load_feature_dictionary_rejects_duplicate_section_items(tmp_path: Path) -> None:
+    payload = _valid_feature_dictionary_payload()
+    payload["challenger"]["numeric"] = ["loan_amnt", " loan_amnt "]
+    path = _write_feature_dictionary(tmp_path, payload)
+
+    with pytest.raises(ValueError, match="duplicate.*loan_amnt|loan_amnt.*duplicate"):
+        load_feature_dictionary(path)
+
+
+def test_load_feature_dictionary_rejects_duplicate_post_origination_items(
+    tmp_path: Path,
+) -> None:
+    payload = _valid_feature_dictionary_payload()
+    payload["post_origination"] = ["recoveries", " recoveries "]
+    path = _write_feature_dictionary(tmp_path, payload)
+
+    with pytest.raises(ValueError, match="duplicate.*recoveries|recoveries.*duplicate"):
+        load_feature_dictionary(path)
+
+
+def test_load_feature_dictionary_rejects_section_overlap(tmp_path: Path) -> None:
+    payload = _valid_feature_dictionary_payload()
+    payload["challenger"] = {
+        "numeric": ["loan_amnt", "shared"],
+        "categorical": ["purpose", " shared "],
+    }
+    path = _write_feature_dictionary(tmp_path, payload)
+
+    with pytest.raises(ValueError, match="overlap.*shared|shared.*overlap"):
+        load_feature_dictionary(path)
+
+
+def test_load_feature_dictionary_strips_feature_name_whitespace(tmp_path: Path) -> None:
+    payload = {
+        "challenger": {"numeric": [" loan_amnt "], "categorical": [" purpose "]},
+        "full_underwriting": {
+            "numeric": [" int_rate "],
+            "categorical": [" grade "],
+        },
+        "post_origination": [" recoveries "],
+    }
+    path = _write_feature_dictionary(tmp_path, payload)
+
+    assert load_feature_dictionary(path) == {
+        "challenger": {"numeric": ["loan_amnt"], "categorical": ["purpose"]},
+        "full_underwriting": {"numeric": ["int_rate"], "categorical": ["grade"]},
+        "post_origination": ["recoveries"],
     }
 
 
