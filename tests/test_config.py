@@ -14,6 +14,9 @@ def test_load_config_has_ordered_partitions() -> None:
     assert config.validation.end < config.calibration.start
     assert config.calibration.end < config.test.start
     assert config.costs.base.lgd == 0.60
+    assert config.costs.lgd_values == [0.40, 0.60, 0.80]
+    assert config.costs.margin_values == [0.03, 0.05, 0.08]
+    assert config.costs.review_cost_values == [15.0, 30.0, 60.0]
 
 
 def test_date_window_rejects_reversed_dates() -> None:
@@ -44,9 +47,9 @@ def test_project_config_rejects_overlapping_partitions() -> None:
                 "minimum_group_size": 200,
                 "costs": {
                     "base": {"lgd": 0.60, "margin": 0.05, "review_cost": 30.0},
-                    "lgd": [0.60],
-                    "margin": [0.05],
-                    "review_cost": [30.0],
+                    "lgd_values": [0.60],
+                    "margin_values": [0.05],
+                    "review_cost_values": [30.0],
                 },
             }
         )

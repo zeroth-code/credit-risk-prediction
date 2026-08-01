@@ -24,9 +24,9 @@ class CostScenario(BaseModel):
 
 class CostConfig(BaseModel):
     base: CostScenario
-    lgd: list[float]
-    margin: list[float]
-    review_cost: list[float]
+    lgd_values: list[float]
+    margin_values: list[float]
+    review_cost_values: list[float]
 
 
 class ProjectConfig(BaseModel):
