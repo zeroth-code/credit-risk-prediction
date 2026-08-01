@@ -181,6 +181,10 @@ def test_tune_lightgbm_returns_only_best_parameter_dictionary() -> None:
     _assert_tuned_parameter_ranges(params)
 
 
+def test_tune_lightgbm_defaults_to_thirty_trials() -> None:
+    assert inspect.signature(tune_lightgbm).parameters["n_trials"].default == 30
+
+
 def test_run_lightgbm_study_temporarily_suppresses_info_logging() -> None:
     x_train, y_train, x_validation, y_validation = _tuning_data()
     original_verbosity = optuna.logging.get_verbosity()

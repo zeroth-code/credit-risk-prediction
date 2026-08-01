@@ -173,7 +173,7 @@ def tune_lightgbm(
     x_validation: object,
     y_validation: np.ndarray,
     *,
-    n_trials: int,
+    n_trials: int = 30,
     random_seed: int,
     scale_pos_weight: float = 1.0,
 ) -> dict[str, float | int]:
