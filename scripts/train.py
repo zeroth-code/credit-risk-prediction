@@ -31,9 +31,18 @@ from credit_risk.training import (  # noqa: E402
     run_lightgbm_study,
 )
 
+
+def _project_path(path: str | Path) -> Path:
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate
+    return PROJECT_ROOT / candidate
+
+
 FEATURE_SETS = ("challenger", "full_underwriting")
 CHALLENGER_LIGHTGBM_STRATEGIES = ("natural", "weighted", "undersampled")
-FEATURE_DICTIONARY_PATH = Path("configs/features.yaml")
+BASE_CONFIG_PATH = _project_path("configs/base.yaml")
+FEATURE_DICTIONARY_PATH = _project_path("configs/features.yaml")
 
 
 def required_feature_columns(feature_dictionary: dict[str, object]) -> list[str]:
@@ -300,11 +309,13 @@ def main(n_trials: int = 30) -> None:
     if not isinstance(n_trials, int) or isinstance(n_trials, bool) or n_trials <= 0:
         raise ValueError("n_trials must be a positive int and must not be a bool")
 
-    config = load_config("configs/base.yaml")
+    config = load_config(BASE_CONFIG_PATH)
     np.random.seed(config.random_seed)
     feature_dictionary = load_feature_dictionary(FEATURE_DICTIONARY_PATH)
     required_columns = required_feature_columns(feature_dictionary)
-    train, validation = load_partitions(config.processed_dir, required_columns)
+    processed_dir = _project_path(config.processed_dir)
+    artifact_dir = _project_path(config.artifact_dir)
+    train, validation = load_partitions(processed_dir, required_columns)
     matrices = build_feature_matrices(
         train,
         validation,
@@ -363,7 +374,7 @@ def main(n_trials: int = 30) -> None:
         "n_trials": n_trials,
     }
     save_training_artifacts(
-        config.artifact_dir,
+        artifact_dir,
         model=final_model,
         preprocessor=challenger["tree_preprocessor"],
         metrics_payload=metrics_payload,

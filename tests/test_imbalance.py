@@ -397,6 +397,115 @@ def test_partition_target_rejects_values_that_would_be_truncated_to_binary() -> 
         )
 
 
+def test_train_main_anchors_project_paths_when_called_from_another_working_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    train_script = _load_train_script("train_project_paths")
+    project_root = train_script.PROJECT_ROOT
+    observed: dict[str, Path] = {}
+    config = SimpleNamespace(
+        random_seed=47,
+        processed_dir=Path("relative/processed"),
+        artifact_dir=Path("relative/artifacts"),
+    )
+    feature_dictionary = {
+        "challenger": {"numeric": ["amount"], "categorical": ["purpose"]},
+        "full_underwriting": {"numeric": ["amount"], "categorical": ["grade"]},
+    }
+    train = pd.DataFrame({"bad": [0, 0, 1, 1]})
+    validation = pd.DataFrame({"bad": [0, 1]})
+    matrices = {
+        "challenger": {
+            "tree_train": np.zeros((4, 1)),
+            "tree_validation": np.zeros((2, 1)),
+            "tree_preprocessor": object(),
+        }
+    }
+
+    def fake_load_config(path: str | Path) -> SimpleNamespace:
+        observed["config"] = Path(path)
+        return config
+
+    def fake_load_feature_dictionary(path: str | Path) -> dict[str, object]:
+        observed["features_load"] = Path(path)
+        return feature_dictionary
+
+    def fake_load_partitions(
+        processed_dir: Path, required_columns: list[str]
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        observed["processed"] = processed_dir
+        assert required_columns == ["amount", "purpose", "grade"]
+        return train, validation
+
+    def fake_build_feature_matrices(
+        train_frame: pd.DataFrame,
+        validation_frame: pd.DataFrame,
+        *,
+        feature_dictionary_path: str | Path,
+    ) -> dict[str, dict[str, object]]:
+        observed["features_build"] = Path(feature_dictionary_path)
+        assert train_frame is train
+        assert validation_frame is validation
+        return matrices
+
+    def fake_run_experiments(*args: object, **kwargs: object) -> list[dict[str, object]]:
+        return [
+            {
+                "model": "lightgbm",
+                "feature_set": "challenger",
+                "imbalance_strategy": strategy,
+                "average_precision": score,
+            }
+            for strategy, score in (
+                ("natural", 0.8),
+                ("weighted", 0.7),
+                ("undersampled", 0.6),
+            )
+        ]
+
+    class FastModel:
+        def fit(self, x: object, y: np.ndarray) -> "FastModel":
+            return self
+
+        def predict_proba(self, x: object) -> np.ndarray:
+            probabilities = np.linspace(0.25, 0.75, x.shape[0])  # type: ignore[attr-defined]
+            return np.column_stack([1.0 - probabilities, probabilities])
+
+    def fake_save_training_artifacts(
+        artifact_dir: Path,
+        *,
+        model: object,
+        preprocessor: object,
+        metrics_payload: dict[str, object],
+        study: object,
+    ) -> None:
+        observed["artifacts"] = artifact_dir
+
+    monkeypatch.setattr(train_script, "load_config", fake_load_config)
+    monkeypatch.setattr(train_script, "load_feature_dictionary", fake_load_feature_dictionary)
+    monkeypatch.setattr(train_script, "load_partitions", fake_load_partitions)
+    monkeypatch.setattr(train_script, "build_feature_matrices", fake_build_feature_matrices)
+    monkeypatch.setattr(train_script, "run_experiments", fake_run_experiments)
+    monkeypatch.setattr(
+        train_script,
+        "run_lightgbm_study",
+        lambda *args, **kwargs: SimpleNamespace(best_params={}),
+    )
+    monkeypatch.setattr(train_script, "make_lightgbm_model", lambda **kwargs: FastModel())
+    monkeypatch.setattr(train_script, "save_training_artifacts", fake_save_training_artifacts)
+    monkeypatch.chdir(tmp_path)
+
+    train_script.main(n_trials=1)
+
+    assert observed == {
+        "config": project_root / "configs/base.yaml",
+        "features_load": project_root / "configs/features.yaml",
+        "features_build": project_root / "configs/features.yaml",
+        "processed": project_root / "relative/processed",
+        "artifacts": project_root / "relative/artifacts",
+    }
+
+
 def test_train_main_writes_reproducible_uncalibrated_artifacts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
