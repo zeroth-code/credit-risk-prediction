@@ -1,13 +1,14 @@
 from pathlib import Path
 from typing import Annotated
 
+import numpy as np
 import pandas as pd
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
 
 DEFAULT_FEATURE_PATH = Path("configs/features.yaml")
 FeatureName = Annotated[
@@ -50,13 +51,63 @@ def _validate_preprocessor_columns(
 def _make_categorical_pipeline() -> Pipeline:
     return Pipeline(
         steps=[
-            ("imputer", SimpleImputer(strategy="most_frequent")),
+            (
+                "imputer",
+                SimpleImputer(
+                    missing_values=pd.NA,
+                    strategy="most_frequent",
+                    keep_empty_features=True,
+                ),
+            ),
             (
                 "encoder",
                 OneHotEncoder(handle_unknown="ignore", min_frequency=25),
             ),
         ]
     )
+
+
+def _normalize_numeric(values: pd.DataFrame | np.ndarray) -> pd.DataFrame | np.ndarray:
+    is_frame = isinstance(values, pd.DataFrame)
+    if is_frame:
+        frame = values
+        original_shape: tuple[int, ...] | None = None
+    else:
+        array = np.asarray(values, dtype=object)
+        original_shape = array.shape
+        if array.ndim == 1:
+            array = array.reshape(-1, 1)
+        elif array.ndim != 2:
+            raise ValueError(f"numeric input must be one- or two-dimensional: {array.shape}")
+        frame = pd.DataFrame(array)
+
+    normalized = pd.DataFrame(index=frame.index)
+    for column in frame.columns:
+        original = frame[column]
+        missing = original.isna()
+        prepared = original.astype(object).copy()
+        for position, is_missing in enumerate(missing.to_numpy()):
+            if is_missing:
+                prepared.iloc[position] = np.nan
+                continue
+
+            value = prepared.iloc[position]
+            if isinstance(value, str):
+                value = value.strip()
+                if value.endswith("%"):
+                    value = value[:-1].strip()
+                prepared.iloc[position] = value
+
+        converted = pd.to_numeric(prepared, errors="coerce")
+        invalid = ~missing & converted.isna()
+        if invalid.any():
+            representative = original.loc[invalid].iloc[0]
+            raise ValueError(f"invalid numeric value in column {column!r}: {representative!r}")
+        normalized[column] = converted.astype(float)
+
+    if is_frame:
+        return normalized
+    return normalized.to_numpy(dtype=float).reshape(original_shape)
 
 
 def make_logistic_preprocessor(
@@ -66,14 +117,33 @@ def make_logistic_preprocessor(
     _validate_preprocessor_columns(numeric_columns, categorical_columns)
     numeric_pipeline = Pipeline(
         steps=[
-            ("imputer", SimpleImputer(strategy="median")),
+            (
+                "normalize_numeric",
+                FunctionTransformer(
+                    _normalize_numeric,
+                    validate=False,
+                    feature_names_out="one-to-one",
+                ),
+            ),
+            (
+                "imputer",
+                SimpleImputer(
+                    missing_values=np.nan,
+                    strategy="median",
+                    keep_empty_features=True,
+                ),
+            ),
             ("scaler", StandardScaler()),
         ]
     )
     return ColumnTransformer(
         transformers=[
-            ("numeric", numeric_pipeline, numeric_columns),
-            ("categorical", _make_categorical_pipeline(), categorical_columns),
+            ("numeric", numeric_pipeline, list(numeric_columns)),
+            (
+                "categorical",
+                _make_categorical_pipeline(),
+                list(categorical_columns),
+            ),
         ],
         remainder="drop",
     )
@@ -84,11 +154,34 @@ def make_tree_preprocessor(
     categorical_columns: list[str],
 ) -> ColumnTransformer:
     _validate_preprocessor_columns(numeric_columns, categorical_columns)
-    numeric_pipeline = Pipeline(steps=[("imputer", SimpleImputer(strategy="median"))])
+    numeric_pipeline = Pipeline(
+        steps=[
+            (
+                "normalize_numeric",
+                FunctionTransformer(
+                    _normalize_numeric,
+                    validate=False,
+                    feature_names_out="one-to-one",
+                ),
+            ),
+            (
+                "imputer",
+                SimpleImputer(
+                    missing_values=np.nan,
+                    strategy="median",
+                    keep_empty_features=True,
+                ),
+            ),
+        ]
+    )
     return ColumnTransformer(
         transformers=[
-            ("numeric", numeric_pipeline, numeric_columns),
-            ("categorical", _make_categorical_pipeline(), categorical_columns),
+            ("numeric", numeric_pipeline, list(numeric_columns)),
+            (
+                "categorical",
+                _make_categorical_pipeline(),
+                list(categorical_columns),
+            ),
         ],
         remainder="drop",
     )
