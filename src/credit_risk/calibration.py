@@ -34,6 +34,7 @@ class CalibrationEvaluation:
     metrics: dict[str, dict[str, object]]
     curve: pd.DataFrame
     folds: int
+    evaluation_protocol: str
 
 
 def _validated_target(y_true: object) -> np.ndarray:
@@ -251,6 +252,7 @@ def evaluate_calibration(
 
     probabilities: dict[str, np.ndarray] = {}
     metrics: dict[str, dict[str, object]] = {}
+    performed_oof = False
     for method in methods:
         reason = _skip_reason(
             method,
@@ -265,6 +267,7 @@ def evaluate_calibration(
             method_probabilities = base_model.predict_proba(features)[:, 1]  # type: ignore[attr-defined]
             probability_source = "base_model_calibration_partition"
         else:
+            performed_oof = True
             method_probabilities = np.full(len(target), np.nan)
             assignment_counts = np.zeros(len(target), dtype=int)
             splitter = StratifiedKFold(
@@ -303,12 +306,14 @@ def evaluate_calibration(
 
     selection = select_calibration(target, probabilities)
     curve = calibration_curve_frame(target, probabilities, bins=bins)
+    evaluation_protocol = "stratified_oof" if performed_oof else "base_model_holdout_only"
     return CalibrationEvaluation(
         selection=selection,
         probabilities=probabilities,
         metrics=metrics,
         curve=curve,
-        folds=folds,
+        folds=folds if performed_oof else 0,
+        evaluation_protocol=evaluation_protocol,
     )
 
 

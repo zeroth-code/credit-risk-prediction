@@ -254,6 +254,7 @@ def test_evaluate_calibration_uses_oof_probabilities_for_selection(
     )
 
     assert evaluation.selection.method == "sigmoid"
+    assert evaluation.evaluation_protocol == "stratified_oof"
     assert evaluation.folds == 5
     assert evaluation.metrics["sigmoid"]["brier_score"] == pytest.approx(0.04)
     assert evaluation.metrics["isotonic"]["brier_score"] == pytest.approx(0.25)
@@ -322,11 +323,16 @@ def test_evaluate_calibration_skips_fitted_methods_when_minority_class_is_one() 
         random_seed=31,
     )
 
-    assert evaluation.folds == 1
+    assert evaluation.evaluation_protocol == "base_model_holdout_only"
+    assert evaluation.folds == 0
     assert evaluation.selection.method == "uncalibrated"
     assert list(evaluation.probabilities) == ["uncalibrated"]
     assert evaluation.curve["method"].drop_duplicates().tolist() == ["uncalibrated"]
     assert evaluation.metrics["uncalibrated"]["status"] == "evaluated"
+    assert (
+        evaluation.metrics["uncalibrated"]["probability_source"]
+        == "base_model_calibration_partition"
+    )
     for method in ("sigmoid", "isotonic"):
         assert evaluation.metrics[method]["status"] == "skipped"
         assert "at least 2 samples in each class" in evaluation.metrics[method]["skip_reason"]

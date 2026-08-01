@@ -426,7 +426,7 @@ def main(n_trials: int = 30) -> None:
         "calibration_samples": int(len(y_calibration)),
         "calibration_prevalence": float(np.mean(y_calibration)),
         "ece_bins": 10,
-        "evaluation_protocol": "stratified_oof",
+        "evaluation_protocol": calibration_evaluation.evaluation_protocol,
         "evaluation_partition": "calibration",
         "folds": calibration_evaluation.folds,
         "random_seed": int(config.random_seed),

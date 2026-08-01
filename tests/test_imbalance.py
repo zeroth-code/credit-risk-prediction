@@ -406,6 +406,7 @@ def test_train_main_anchors_project_paths_when_called_from_another_working_direc
     train_script = _load_train_script("train_project_paths")
     project_root = train_script.PROJECT_ROOT
     observed: dict[str, Path] = {}
+    saved_calibration_metrics: dict[str, object] = {}
     config = SimpleNamespace(
         random_seed=47,
         processed_dir=Path("relative/processed"),
@@ -510,6 +511,7 @@ def test_train_main_anchors_project_paths_when_called_from_another_working_direc
         curve: pd.DataFrame,
     ) -> None:
         observed["calibration_artifacts"] = artifact_dir
+        saved_calibration_metrics.update(metrics_payload)
 
     monkeypatch.setattr(train_script, "load_config", fake_load_config)
     monkeypatch.setattr(train_script, "load_feature_dictionary", fake_load_feature_dictionary)
@@ -548,6 +550,7 @@ def test_train_main_anchors_project_paths_when_called_from_another_working_direc
             }
         ),
         folds=0,
+        evaluation_protocol="base_model_holdout_only",
     )
     monkeypatch.setattr(train_script, "evaluate_calibration", lambda *args, **kwargs: evaluation)
     monkeypatch.setattr(train_script, "fit_calibrated_model", lambda model, *args, **kwargs: model)
@@ -570,6 +573,8 @@ def test_train_main_anchors_project_paths_when_called_from_another_working_direc
         "artifacts": project_root / "relative/artifacts",
         "calibration_artifacts": project_root / "relative/artifacts",
     }
+    assert saved_calibration_metrics["evaluation_protocol"] == "base_model_holdout_only"
+    assert saved_calibration_metrics["folds"] == 0
 
 
 def test_train_main_writes_reproducible_calibrated_artifacts(
