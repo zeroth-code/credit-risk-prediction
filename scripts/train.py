@@ -12,7 +12,14 @@ import joblib  # noqa: E402
 import numpy as np  # noqa: E402
 import optuna  # noqa: E402
 import pandas as pd  # noqa: E402
+from sklearn.calibration import CalibratedClassifierCV  # noqa: E402
+from sklearn.frozen import FrozenEstimator  # noqa: E402
+from sklearn.metrics import log_loss  # noqa: E402
 
+from credit_risk.calibration import (  # noqa: E402
+    expected_calibration_error,
+    select_calibration,
+)
 from credit_risk.config import load_config  # noqa: E402
 from credit_risk.features import (  # noqa: E402
     build_feature_frame,
@@ -41,6 +48,7 @@ def _project_path(path: str | Path) -> Path:
 
 FEATURE_SETS = ("challenger", "full_underwriting")
 CHALLENGER_LIGHTGBM_STRATEGIES = ("natural", "weighted", "undersampled")
+CALIBRATION_METHODS = ("uncalibrated", "sigmoid", "isotonic")
 BASE_CONFIG_PATH = _project_path("configs/base.yaml")
 FEATURE_DICTIONARY_PATH = _project_path("configs/features.yaml")
 
@@ -57,9 +65,9 @@ def required_feature_columns(feature_dictionary: dict[str, object]) -> list[str]
 
 def load_partitions(
     processed_dir: Path, required_columns: list[str]
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     partitions: dict[str, pd.DataFrame] = {}
-    for partition_name in ("train", "validation"):
+    for partition_name in ("train", "validation", "calibration"):
         path = processed_dir / f"{partition_name}.parquet"
         frame = pd.read_parquet(path)
         missing = [column for column in ["bad", *required_columns] if column not in frame.columns]
@@ -68,7 +76,7 @@ def load_partitions(
                 f"{partition_name} partition missing required columns: {', '.join(missing)}"
             )
         partitions[partition_name] = frame
-    return partitions["train"], partitions["validation"]
+    return partitions["train"], partitions["validation"], partitions["calibration"]
 
 
 def partition_target(frame: pd.DataFrame, *, partition_name: str) -> np.ndarray:
@@ -78,6 +86,66 @@ def partition_target(frame: pd.DataFrame, *, partition_name: str) -> np.ndarray:
     except ValueError as exc:
         raise ValueError(f"{partition_name} bad target invalid: {exc}") from exc
     return target.astype(int, copy=False)
+
+
+def calibration_curve_frame(
+    y_true: object,
+    candidates: dict[str, object],
+    *,
+    bins: int = 10,
+) -> pd.DataFrame:
+    target = np.asarray(y_true)
+    edges = np.linspace(0.0, 1.0, bins + 1)
+    rows: list[dict[str, object]] = []
+    for method, probabilities in candidates.items():
+        expected_calibration_error(target, probabilities, bins=bins)
+        probability_array = np.asarray(probabilities, dtype=float)
+        bin_indices = np.minimum((probability_array * bins).astype(int), bins - 1)
+        for bin_index in range(bins):
+            members = bin_indices == bin_index
+            sample_count = int(members.sum())
+            rows.append(
+                {
+                    "method": method,
+                    "bin_index": bin_index,
+                    "bin_lower": float(edges[bin_index]),
+                    "bin_upper": float(edges[bin_index + 1]),
+                    "sample_count": sample_count,
+                    "mean_probability": (
+                        float(probability_array[members].mean()) if sample_count else np.nan
+                    ),
+                    "observed_default_rate": (
+                        float(target[members].mean()) if sample_count else np.nan
+                    ),
+                }
+            )
+    return pd.DataFrame.from_records(rows)
+
+
+def fit_calibration_candidates(
+    model: object,
+    x_calibration: object,
+    y_calibration: np.ndarray,
+    *,
+    methods: list[str],
+) -> tuple[dict[str, object], dict[str, np.ndarray]]:
+    missing = [method for method in CALIBRATION_METHODS if method not in methods]
+    if missing:
+        raise ValueError(f"missing required calibration methods: {', '.join(missing)}")
+
+    estimators: dict[str, object] = {}
+    candidates: dict[str, np.ndarray] = {}
+    for method in methods:
+        if method == "uncalibrated":
+            estimator = model
+        else:
+            estimator = CalibratedClassifierCV(
+                FrozenEstimator(model),
+                method=method,
+            ).fit(x_calibration, y_calibration)
+        estimators[method] = estimator
+        candidates[method] = estimator.predict_proba(x_calibration)[:, 1]  # type: ignore[attr-defined]
+    return estimators, candidates
 
 
 def build_feature_matrices(
@@ -305,6 +373,24 @@ def save_training_artifacts(
     trials.to_csv(artifact_dir / "tuning_trials.csv", index=False, encoding="utf-8")
 
 
+def save_calibration_artifacts(
+    artifact_dir: Path,
+    *,
+    calibrated_model: object,
+    metrics_payload: dict[str, object],
+    curve: pd.DataFrame,
+) -> None:
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    joblib.dump(calibrated_model, artifact_dir / "calibrated_model.joblib")
+    with (artifact_dir / "calibration_metrics.json").open("w", encoding="utf-8") as file:
+        json.dump(_json_native(metrics_payload), file, ensure_ascii=False, indent=2)
+    curve.to_csv(
+        artifact_dir / "calibration_curve.csv",
+        index=False,
+        encoding="utf-8",
+    )
+
+
 def main(n_trials: int = 30) -> None:
     if not isinstance(n_trials, int) or isinstance(n_trials, bool) or n_trials <= 0:
         raise ValueError("n_trials must be a positive int and must not be a bool")
@@ -315,7 +401,7 @@ def main(n_trials: int = 30) -> None:
     required_columns = required_feature_columns(feature_dictionary)
     processed_dir = _project_path(config.processed_dir)
     artifact_dir = _project_path(config.artifact_dir)
-    train, validation = load_partitions(processed_dir, required_columns)
+    train, validation, calibration = load_partitions(processed_dir, required_columns)
     matrices = build_feature_matrices(
         train,
         validation,
@@ -324,6 +410,7 @@ def main(n_trials: int = 30) -> None:
 
     y_train = partition_target(train, partition_name="train")
     y_validation = partition_target(validation, partition_name="validation")
+    y_calibration = partition_target(calibration, partition_name="calibration")
     scale_pos_weight = positive_class_weight(y_train)
     undersample_indices = random_undersample_indices(y_train, config.random_seed)
     experiments = run_experiments(
@@ -363,6 +450,41 @@ def main(n_trials: int = 30) -> None:
     tuned_probabilities = final_model.predict_proba(challenger["tree_validation"])[:, 1]
     tuned_metrics = binary_metrics(y_validation, tuned_probabilities, threshold=0.5)
 
+    challenger_config = feature_dictionary["challenger"]
+    challenger_columns = challenger_config["numeric"] + challenger_config["categorical"]
+    calibration_frame = build_feature_frame(
+        calibration,
+        challenger_columns,
+        path=FEATURE_DICTIONARY_PATH,
+    )
+    calibration_matrix = challenger["tree_preprocessor"].transform(calibration_frame)  # type: ignore[attr-defined]
+    calibration_estimators, calibration_candidates = fit_calibration_candidates(
+        final_model,
+        calibration_matrix,
+        y_calibration,
+        methods=config.calibration_methods,
+    )
+    calibration_selection = select_calibration(y_calibration, calibration_candidates)
+    calibration_method_metrics = {
+        method: {
+            "brier_score": calibration_selection.scores[method],
+            "log_loss": float(log_loss(y_calibration, probabilities, labels=[0, 1])),
+            "expected_calibration_error": expected_calibration_error(
+                y_calibration,
+                probabilities,
+            ),
+        }
+        for method, probabilities in calibration_candidates.items()
+    }
+    calibration_metrics_payload: dict[str, object] = {
+        "selected_method": calibration_selection.method,
+        "methods": calibration_method_metrics,
+        "calibration_samples": int(len(y_calibration)),
+        "calibration_prevalence": float(np.mean(y_calibration)),
+        "ece_bins": 10,
+    }
+    calibration_curve = calibration_curve_frame(y_calibration, calibration_candidates)
+
     metrics_payload: dict[str, object] = {
         "primary_feature_set": "challenger",
         "experiments": experiments,
@@ -379,6 +501,12 @@ def main(n_trials: int = 30) -> None:
         preprocessor=challenger["tree_preprocessor"],
         metrics_payload=metrics_payload,
         study=study,
+    )
+    save_calibration_artifacts(
+        artifact_dir,
+        calibrated_model=calibration_estimators[calibration_selection.method],
+        metrics_payload=calibration_metrics_payload,
+        curve=calibration_curve,
     )
 
 

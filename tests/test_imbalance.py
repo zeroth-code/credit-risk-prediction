@@ -13,6 +13,7 @@ import optuna
 import pandas as pd
 import pytest
 from sklearn.datasets import make_classification
+from sklearn.metrics import brier_score_loss
 
 from credit_risk.features import load_feature_dictionary
 from credit_risk.training import (
@@ -407,6 +408,7 @@ def test_train_main_anchors_project_paths_when_called_from_another_working_direc
         random_seed=47,
         processed_dir=Path("relative/processed"),
         artifact_dir=Path("relative/artifacts"),
+        calibration_methods=["uncalibrated", "sigmoid", "isotonic"],
     )
     feature_dictionary = {
         "challenger": {"numeric": ["amount"], "categorical": ["purpose"]},
@@ -414,11 +416,17 @@ def test_train_main_anchors_project_paths_when_called_from_another_working_direc
     }
     train = pd.DataFrame({"bad": [0, 0, 1, 1]})
     validation = pd.DataFrame({"bad": [0, 1]})
+    calibration = pd.DataFrame({"bad": [0, 1]})
+
+    class FastPreprocessor:
+        def transform(self, frame: pd.DataFrame) -> np.ndarray:
+            return np.zeros((len(frame), 1))
+
     matrices = {
         "challenger": {
             "tree_train": np.zeros((4, 1)),
             "tree_validation": np.zeros((2, 1)),
-            "tree_preprocessor": object(),
+            "tree_preprocessor": FastPreprocessor(),
         }
     }
 
@@ -432,10 +440,10 @@ def test_train_main_anchors_project_paths_when_called_from_another_working_direc
 
     def fake_load_partitions(
         processed_dir: Path, required_columns: list[str]
-    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         observed["processed"] = processed_dir
         assert required_columns == ["amount", "purpose", "grade"]
-        return train, validation
+        return train, validation, calibration
 
     def fake_build_feature_matrices(
         train_frame: pd.DataFrame,
@@ -447,6 +455,17 @@ def test_train_main_anchors_project_paths_when_called_from_another_working_direc
         assert train_frame is train
         assert validation_frame is validation
         return matrices
+
+    def fake_build_feature_frame(
+        frame: pd.DataFrame,
+        columns: list[str],
+        *,
+        path: str | Path,
+    ) -> pd.DataFrame:
+        observed["calibration_build"] = Path(path)
+        assert frame is calibration
+        assert columns == ["amount", "purpose"]
+        return pd.DataFrame({"amount": [0.0, 1.0], "purpose": ["a", "b"]})
 
     def fake_run_experiments(*args: object, **kwargs: object) -> list[dict[str, object]]:
         return [
@@ -481,10 +500,20 @@ def test_train_main_anchors_project_paths_when_called_from_another_working_direc
     ) -> None:
         observed["artifacts"] = artifact_dir
 
+    def fake_save_calibration_artifacts(
+        artifact_dir: Path,
+        *,
+        calibrated_model: object,
+        metrics_payload: dict[str, object],
+        curve: pd.DataFrame,
+    ) -> None:
+        observed["calibration_artifacts"] = artifact_dir
+
     monkeypatch.setattr(train_script, "load_config", fake_load_config)
     monkeypatch.setattr(train_script, "load_feature_dictionary", fake_load_feature_dictionary)
     monkeypatch.setattr(train_script, "load_partitions", fake_load_partitions)
     monkeypatch.setattr(train_script, "build_feature_matrices", fake_build_feature_matrices)
+    monkeypatch.setattr(train_script, "build_feature_frame", fake_build_feature_frame)
     monkeypatch.setattr(train_script, "run_experiments", fake_run_experiments)
     monkeypatch.setattr(
         train_script,
@@ -492,7 +521,20 @@ def test_train_main_anchors_project_paths_when_called_from_another_working_direc
         lambda *args, **kwargs: SimpleNamespace(best_params={}),
     )
     monkeypatch.setattr(train_script, "make_lightgbm_model", lambda **kwargs: FastModel())
+    monkeypatch.setattr(
+        train_script,
+        "fit_calibration_candidates",
+        lambda *args, **kwargs: (
+            {method: args[0] for method in config.calibration_methods},
+            {method: np.array([0.25, 0.75]) for method in config.calibration_methods},
+        ),
+    )
     monkeypatch.setattr(train_script, "save_training_artifacts", fake_save_training_artifacts)
+    monkeypatch.setattr(
+        train_script,
+        "save_calibration_artifacts",
+        fake_save_calibration_artifacts,
+    )
     monkeypatch.chdir(tmp_path)
 
     train_script.main(n_trials=1)
@@ -501,12 +543,14 @@ def test_train_main_anchors_project_paths_when_called_from_another_working_direc
         "config": project_root / "configs/base.yaml",
         "features_load": project_root / "configs/features.yaml",
         "features_build": project_root / "configs/features.yaml",
+        "calibration_build": project_root / "configs/features.yaml",
         "processed": project_root / "relative/processed",
         "artifacts": project_root / "relative/artifacts",
+        "calibration_artifacts": project_root / "relative/artifacts",
     }
 
 
-def test_train_main_writes_reproducible_uncalibrated_artifacts(
+def test_train_main_writes_reproducible_calibrated_artifacts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     train_script = _load_train_script("train_integration")
@@ -515,23 +559,46 @@ def test_train_main_writes_reproducible_uncalibrated_artifacts(
     processed_dir.mkdir()
     train = _synthetic_partition(rows=120, positives=30, seed=101)
     validation = _synthetic_partition(rows=60, positives=20, seed=103)
+    calibration = _synthetic_partition(rows=80, positives=24, seed=107)
     validation.loc[0, "purpose"] = "validation_only_purpose"
     validation.loc[0, "annual_inc"] = 10_000_000.0
     validation.loc[1, "annual_inc"] = np.nan
+    calibration.loc[0, "purpose"] = "calibration_only_purpose"
+    calibration.loc[0, "annual_inc"] = 20_000_000.0
+    calibration.loc[1, "annual_inc"] = np.nan
     train_path = processed_dir / "train.parquet"
     validation_path = processed_dir / "validation.parquet"
+    calibration_path = processed_dir / "calibration.parquet"
+    test_path = processed_dir / "test.parquet"
     train.to_parquet(train_path, index=False)
     validation.to_parquet(validation_path, index=False)
+    calibration.to_parquet(calibration_path, index=False)
+    _synthetic_partition(rows=40, positives=10, seed=109).to_parquet(test_path, index=False)
     input_bytes = {
         train_path: train_path.read_bytes(),
         validation_path: validation_path.read_bytes(),
+        calibration_path: calibration_path.read_bytes(),
+        test_path: test_path.read_bytes(),
     }
     config = SimpleNamespace(
         random_seed=43,
         processed_dir=processed_dir,
         artifact_dir=artifact_dir,
+        calibration_methods=["uncalibrated", "sigmoid", "isotonic"],
     )
     monkeypatch.setattr(train_script, "load_config", lambda path: config)
+
+    original_read_parquet = train_script.pd.read_parquet
+    read_partitions: list[str] = []
+
+    def guarded_read_parquet(path: Path, *args: object, **kwargs: object) -> pd.DataFrame:
+        partition_name = Path(path).stem
+        read_partitions.append(partition_name)
+        if partition_name == "test":
+            raise AssertionError("test partition must not be read during training")
+        return original_read_parquet(path, *args, **kwargs)
+
+    monkeypatch.setattr(train_script.pd, "read_parquet", guarded_read_parquet)
 
     original_make_lightgbm_model = train_script.make_lightgbm_model
 
@@ -581,14 +648,53 @@ def test_train_main_writes_reproducible_uncalibrated_artifacts(
         "preprocessor.joblib",
         "validation_metrics.json",
         "tuning_trials.csv",
+        "calibrated_model.joblib",
+        "calibration_metrics.json",
+        "calibration_curve.csv",
     }
     assert {path.name for path in artifact_dir.iterdir()} == expected_artifacts
     model = joblib.load(artifact_dir / "uncalibrated_model.joblib")
+    calibrated_model = joblib.load(artifact_dir / "calibrated_model.joblib")
     preprocessor = joblib.load(artifact_dir / "preprocessor.joblib")
     metrics_payload = json.loads(
         (artifact_dir / "validation_metrics.json").read_text(encoding="utf-8")
     )
+    calibration_metrics = json.loads(
+        (artifact_dir / "calibration_metrics.json").read_text(encoding="utf-8")
+    )
+    calibration_curve = pd.read_csv(artifact_dir / "calibration_curve.csv")
     trials = pd.read_csv(artifact_dir / "tuning_trials.csv")
+
+    assert read_partitions == ["train", "validation", "calibration"]
+    assert calibration_metrics["calibration_samples"] == len(calibration)
+    assert calibration_metrics["calibration_prevalence"] == pytest.approx(calibration["bad"].mean())
+    assert list(calibration_metrics["methods"]) == config.calibration_methods
+    for method_metrics in calibration_metrics["methods"].values():
+        assert set(method_metrics) == {
+            "brier_score",
+            "log_loss",
+            "expected_calibration_error",
+        }
+        assert all(np.isfinite(value) for value in method_metrics.values())
+    selected_method = calibration_metrics["selected_method"]
+    assert selected_method == min(
+        config.calibration_methods,
+        key=lambda method: calibration_metrics["methods"][method]["brier_score"],
+    )
+    assert calibration_curve.columns.tolist() == [
+        "method",
+        "bin_index",
+        "bin_lower",
+        "bin_upper",
+        "sample_count",
+        "mean_probability",
+        "observed_default_rate",
+    ]
+    assert len(calibration_curve) == 10 * len(config.calibration_methods)
+    assert calibration_curve["method"].drop_duplicates().tolist() == config.calibration_methods
+    assert calibration_curve.groupby("method", sort=False)["sample_count"].sum().to_dict() == {
+        method: len(calibration) for method in config.calibration_methods
+    }
 
     assert metrics_payload["primary_feature_set"] == "challenger"
     assert metrics_payload["random_seed"] == 43
@@ -663,6 +769,7 @@ def test_train_main_writes_reproducible_uncalibrated_artifacts(
     categorical_encoder = preprocessor.named_transformers_["categorical"].named_steps["encoder"]
     purpose_categories = categorical_encoder.categories_[0]
     assert "validation_only_purpose" not in purpose_categories
+    assert "calibration_only_purpose" not in purpose_categories
 
     challenger_columns = (
         load_feature_dictionary()["challenger"]["numeric"]
@@ -672,6 +779,13 @@ def test_train_main_writes_reproducible_uncalibrated_artifacts(
     probabilities = model.predict_proba(transformed_validation)[:, 1]
     assert probabilities.shape == (len(validation),)
     assert np.isfinite(probabilities).all()
+    transformed_calibration = preprocessor.transform(calibration.loc[:, challenger_columns])
+    calibrated_probabilities = calibrated_model.predict_proba(transformed_calibration)[:, 1]
+    assert calibrated_probabilities.shape == (len(calibration),)
+    assert np.isfinite(calibrated_probabilities).all()
+    assert brier_score_loss(calibration["bad"], calibrated_probabilities) == pytest.approx(
+        calibration_metrics["methods"][selected_method]["brier_score"]
+    )
     assert set(trials.columns) >= {
         "number",
         "value",
