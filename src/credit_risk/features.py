@@ -4,6 +4,10 @@ from typing import Annotated
 import pandas as pd
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 DEFAULT_FEATURE_PATH = Path("configs/features.yaml")
 FeatureName = Annotated[
@@ -20,6 +24,74 @@ def _duplicate_values(values: list[str]) -> list[str]:
             duplicates.append(value)
         seen.add(value)
     return duplicates
+
+
+def _validate_preprocessor_columns(
+    numeric_columns: list[str],
+    categorical_columns: list[str],
+) -> None:
+    if not numeric_columns and not categorical_columns:
+        raise ValueError("at least one numeric or categorical column is required")
+
+    for group_name, columns in (
+        ("numeric_columns", numeric_columns),
+        ("categorical_columns", categorical_columns),
+    ):
+        duplicates = _duplicate_values(columns)
+        if duplicates:
+            raise ValueError(f"{group_name} contains duplicate columns: {', '.join(duplicates)}")
+
+    categorical = set(categorical_columns)
+    overlap = [column for column in numeric_columns if column in categorical]
+    if overlap:
+        raise ValueError(f"numeric_columns/categorical_columns overlap: {', '.join(overlap)}")
+
+
+def _make_categorical_pipeline() -> Pipeline:
+    return Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="most_frequent")),
+            (
+                "encoder",
+                OneHotEncoder(handle_unknown="ignore", min_frequency=25),
+            ),
+        ]
+    )
+
+
+def make_logistic_preprocessor(
+    numeric_columns: list[str],
+    categorical_columns: list[str],
+) -> ColumnTransformer:
+    _validate_preprocessor_columns(numeric_columns, categorical_columns)
+    numeric_pipeline = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="median")),
+            ("scaler", StandardScaler()),
+        ]
+    )
+    return ColumnTransformer(
+        transformers=[
+            ("numeric", numeric_pipeline, numeric_columns),
+            ("categorical", _make_categorical_pipeline(), categorical_columns),
+        ],
+        remainder="drop",
+    )
+
+
+def make_tree_preprocessor(
+    numeric_columns: list[str],
+    categorical_columns: list[str],
+) -> ColumnTransformer:
+    _validate_preprocessor_columns(numeric_columns, categorical_columns)
+    numeric_pipeline = Pipeline(steps=[("imputer", SimpleImputer(strategy="median"))])
+    return ColumnTransformer(
+        transformers=[
+            ("numeric", numeric_pipeline, numeric_columns),
+            ("categorical", _make_categorical_pipeline(), categorical_columns),
+        ],
+        remainder="drop",
+    )
 
 
 class _FeatureModel(BaseModel):
