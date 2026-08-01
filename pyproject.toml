@@ -8,11 +8,8 @@ dependencies = [
     "fairlearn",
     "imbalanced-learn",
     "joblib",
-    # SHAP otherwise resolves Python-3.12-incompatible legacy releases.
-    "llvmlite>=0.46",
     "lightgbm",
     "matplotlib",
-    "numba>=0.63",
     "numpy",
     "optuna",
     "pandas",
