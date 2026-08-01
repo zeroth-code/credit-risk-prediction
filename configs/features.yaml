@@ -1,0 +1,59 @@
+challenger:
+  numeric:
+    - loan_amnt
+    - annual_inc
+    - dti
+    - delinq_2yrs
+    - fico_range_low
+    - fico_range_high
+    - inq_last_6mths
+    - open_acc
+    - pub_rec
+    - revol_bal
+    - revol_util
+    - total_acc
+  categorical:
+    - purpose
+    - home_ownership
+    - verification_status
+    - emp_length
+    - addr_state
+
+full_underwriting:
+  numeric:
+    - loan_amnt
+    - annual_inc
+    - dti
+    - delinq_2yrs
+    - fico_range_low
+    - fico_range_high
+    - inq_last_6mths
+    - open_acc
+    - pub_rec
+    - revol_bal
+    - revol_util
+    - total_acc
+    - int_rate
+  categorical:
+    - purpose
+    - home_ownership
+    - verification_status
+    - emp_length
+    - addr_state
+    - grade
+    - sub_grade
+
+post_origination:
+  - total_pymnt
+  - total_pymnt_inv
+  - total_rec_prncp
+  - total_rec_int
+  - total_rec_late_fee
+  - recoveries
+  - collection_recovery_fee
+  - last_pymnt_d
+  - last_pymnt_amnt
+  - next_pymnt_d
+  - out_prncp
+  - out_prncp_inv
+  - last_credit_pull_d
