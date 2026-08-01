@@ -1,11 +1,26 @@
 from datetime import date
 from pathlib import Path
+from typing import Annotated, Literal
 
 import yaml
-from pydantic import BaseModel, Field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    FiniteFloat,
+    StrictInt,
+    model_validator,
+)
+
+Probability = Annotated[FiniteFloat, Field(ge=0, le=1)]
+NonnegativeCost = Annotated[FiniteFloat, Field(ge=0)]
 
 
-class DateWindow(BaseModel):
+class ConfigModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class DateWindow(ConfigModel):
     start: date
     end: date
 
@@ -16,21 +31,21 @@ class DateWindow(BaseModel):
         return self
 
 
-class CostScenario(BaseModel):
-    lgd: float = Field(ge=0, le=1)
-    margin: float = Field(ge=0, le=1)
-    review_cost: float = Field(ge=0)
+class CostScenario(ConfigModel):
+    lgd: Probability
+    margin: Probability
+    review_cost: NonnegativeCost
 
 
-class CostConfig(BaseModel):
+class CostConfig(ConfigModel):
     base: CostScenario
-    lgd_values: list[float]
-    margin_values: list[float]
-    review_cost_values: list[float]
+    lgd_values: list[Probability] = Field(min_length=1)
+    margin_values: list[Probability] = Field(min_length=1)
+    review_cost_values: list[NonnegativeCost] = Field(min_length=1)
 
 
-class ProjectConfig(BaseModel):
-    random_seed: int
+class ProjectConfig(ConfigModel):
+    random_seed: StrictInt
     raw_csv: Path
     processed_dir: Path
     artifact_dir: Path
@@ -40,10 +55,10 @@ class ProjectConfig(BaseModel):
     calibration: DateWindow
     test: DateWindow
     loan_term: str
-    good_statuses: list[str]
-    bad_statuses: list[str]
+    good_statuses: list[str] = Field(min_length=1)
+    bad_statuses: list[str] = Field(min_length=1)
     unresolved_statuses: list[str]
-    calibration_methods: list[str]
+    calibration_methods: list[Literal["uncalibrated", "sigmoid", "isotonic"]] = Field(min_length=1)
     minimum_group_size: int = Field(ge=1)
     costs: CostConfig
 
@@ -52,7 +67,24 @@ class ProjectConfig(BaseModel):
         windows = [self.train, self.validation, self.calibration, self.test]
         for left, right in zip(windows, windows[1:]):  # noqa: B905
             if left.end >= right.start:
-                raise ValueError("date partitions must be ordered and non-overlapping")
+                raise ValueError(
+                    "date partitions must be ordered and non-overlapping: "
+                    f"{left.end.isoformat()} is not before {right.start.isoformat()}"
+                )
+
+        status_groups = [self.good_statuses, self.bad_statuses, self.unresolved_statuses]
+        if any(len(group) != len(set(group)) for group in status_groups):
+            raise ValueError("status groups must not contain duplicate statuses")
+
+        good_statuses = set(self.good_statuses)
+        bad_statuses = set(self.bad_statuses)
+        unresolved_statuses = set(self.unresolved_statuses)
+        if (
+            good_statuses & bad_statuses
+            or good_statuses & unresolved_statuses
+            or bad_statuses & unresolved_statuses
+        ):
+            raise ValueError("good, bad, and unresolved status groups must be disjoint")
         return self
 
 
