@@ -1,0 +1,55 @@
+random_seed: 42
+raw_csv: data/raw/accepted_2007_to_2018Q4.csv
+processed_dir: data/processed
+artifact_dir: artifacts
+figure_dir: reports/figures
+
+train:
+  start: 2011-01-01
+  end: 2013-12-31
+validation:
+  start: 2014-01-01
+  end: 2014-06-30
+calibration:
+  start: 2014-07-01
+  end: 2014-12-31
+test:
+  start: 2015-01-01
+  end: 2015-12-31
+
+loan_term: "36 months"
+good_statuses:
+  - Fully Paid
+bad_statuses:
+  - Charged Off
+  - Default
+unresolved_statuses:
+  - Current
+  - In Grace Period
+  - Issued
+  - Late (16-30 days)
+  - Late (31-120 days)
+
+calibration_methods:
+  - uncalibrated
+  - sigmoid
+  - isotonic
+minimum_group_size: 200
+
+costs:
+  base:
+    lgd: 0.60
+    margin: 0.05
+    review_cost: 30.0
+  lgd:
+    - 0.40
+    - 0.60
+    - 0.80
+  margin:
+    - 0.03
+    - 0.05
+    - 0.08
+  review_cost:
+    - 15.0
+    - 30.0
+    - 60.0
