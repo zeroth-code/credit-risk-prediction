@@ -715,6 +715,10 @@ def test_train_main_anchors_project_paths_when_called_from_another_working_direc
         "calibration_approval_rate": 0.5,
         "calibration_review_rate": 0.0,
         "calibration_decline_rate": 0.5,
+        "calibration_samples": 2,
+        "total_loan_amount": 3000.0,
+        "currency": "USD",
+        "calibration_cost_per_1000_applications": 61500.0,
         "selected_calibration_method": "sigmoid",
         "probability_source": "stratified_oof",
         "selection_partition": "calibration",
@@ -725,22 +729,34 @@ def test_train_main_anchors_project_paths_when_called_from_another_working_direc
         "lgd",
         "margin",
         "review_cost",
+        "is_base_scenario",
         "optimal_approve_below",
         "optimal_decline_at",
         "optimal_cost",
+        "optimal_cost_per_1000_applications",
         "optimal_approval_rate",
         "optimal_review_rate",
         "optimal_decline_rate",
         "base_approve_below",
         "base_decline_at",
         "frozen_base_cost",
+        "frozen_base_cost_per_1000_applications",
         "frozen_base_approval_rate",
         "frozen_base_review_rate",
         "frozen_base_decline_rate",
     ]
     assert len(saved_sensitivity) == 27
+    assert saved_sensitivity["is_base_scenario"].sum() == 1
     assert (saved_sensitivity["optimal_approve_below"] == 0.25).all()
     assert (saved_sensitivity["base_approve_below"] == 0.2).all()
+    assert np.allclose(
+        saved_sensitivity["optimal_cost_per_1000_applications"],
+        saved_sensitivity["optimal_cost"] / 2 * 1000,
+    )
+    assert np.allclose(
+        saved_sensitivity["frozen_base_cost_per_1000_applications"],
+        saved_sensitivity["frozen_base_cost"] / 2 * 1000,
+    )
 
 
 def test_train_main_writes_reproducible_calibrated_artifacts(
@@ -865,7 +881,9 @@ def test_train_main_writes_reproducible_calibrated_artifacts(
         (artifact_dir / "calibration_metrics.json").read_text(encoding="utf-8")
     )
     calibration_curve = pd.read_csv(artifact_dir / "calibration_curve.csv")
-    policy = json.loads((artifact_dir / "policy.json").read_text(encoding="utf-8"))
+    policy_text = (artifact_dir / "policy.json").read_text(encoding="utf-8")
+    sensitivity_text = (artifact_dir / "cost_sensitivity.csv").read_text(encoding="utf-8")
+    policy = json.loads(policy_text)
     cost_sensitivity = pd.read_csv(artifact_dir / "cost_sensitivity.csv")
     trials = pd.read_csv(artifact_dir / "tuning_trials.csv")
 
@@ -1050,6 +1068,12 @@ def test_train_main_writes_reproducible_calibrated_artifacts(
         "calibration_approval_rate": expected_policy["approval_rate"],
         "calibration_review_rate": expected_policy["review_rate"],
         "calibration_decline_rate": expected_policy["decline_rate"],
+        "calibration_samples": len(calibration),
+        "total_loan_amount": pytest.approx(calibration["loan_amnt"].sum()),
+        "currency": "USD",
+        "calibration_cost_per_1000_applications": pytest.approx(
+            expected_policy["cost"] / len(calibration) * 1000
+        ),
         "selected_calibration_method": selected_method,
         "probability_source": expected_calibration_evaluation.metrics[selected_method][
             "probability_source"
@@ -1062,20 +1086,24 @@ def test_train_main_writes_reproducible_calibrated_artifacts(
         "lgd",
         "margin",
         "review_cost",
+        "is_base_scenario",
         "optimal_approve_below",
         "optimal_decline_at",
         "optimal_cost",
+        "optimal_cost_per_1000_applications",
         "optimal_approval_rate",
         "optimal_review_rate",
         "optimal_decline_rate",
         "base_approve_below",
         "base_decline_at",
         "frozen_base_cost",
+        "frozen_base_cost_per_1000_applications",
         "frozen_base_approval_rate",
         "frozen_base_review_rate",
         "frozen_base_decline_rate",
     ]
     assert len(cost_sensitivity) == 27
+    assert cost_sensitivity["is_base_scenario"].sum() == 1
     assert set(
         cost_sensitivity[["lgd", "margin", "review_cost"]].itertuples(index=False, name=None)
     ) == {
@@ -1109,6 +1137,16 @@ def test_train_main_writes_reproducible_calibrated_artifacts(
     assert base_scenario["optimal_decline_at"] == pytest.approx(policy["decline_at"])
     assert base_scenario["optimal_cost"] == pytest.approx(policy["calibration_cost"])
     assert base_scenario["frozen_base_cost"] == pytest.approx(policy["calibration_cost"])
+    assert np.allclose(
+        cost_sensitivity["optimal_cost_per_1000_applications"],
+        cost_sensitivity["optimal_cost"] / len(calibration) * 1000,
+    )
+    assert np.allclose(
+        cost_sensitivity["frozen_base_cost_per_1000_applications"],
+        cost_sensitivity["frozen_base_cost"] / len(calibration) * 1000,
+    )
+    assert "0.39999999999999997" not in policy_text
+    assert "0.39999999999999997" not in sensitivity_text
     assert set(trials.columns) >= {
         "number",
         "value",

@@ -53,15 +53,18 @@ COST_SENSITIVITY_COLUMNS = [
     "lgd",
     "margin",
     "review_cost",
+    "is_base_scenario",
     "optimal_approve_below",
     "optimal_decline_at",
     "optimal_cost",
+    "optimal_cost_per_1000_applications",
     "optimal_approval_rate",
     "optimal_review_rate",
     "optimal_decline_rate",
     "base_approve_below",
     "base_decline_at",
     "frozen_base_cost",
+    "frozen_base_cost_per_1000_applications",
     "frozen_base_approval_rate",
     "frozen_base_review_rate",
     "frozen_base_decline_rate",
@@ -391,6 +394,8 @@ def build_policy_artifacts(
         "review_rate": float(np.mean(frozen_actions == "manual_review")),
         "decline_rate": float(np.mean(frozen_actions == "decline")),
     }
+    calibration_samples = int(len(y_true))
+    cost_normalization = 1000.0 / calibration_samples
     policy_payload: dict[str, object] = {
         "approve_below": approve_below,
         "decline_at": decline_at,
@@ -401,6 +406,10 @@ def build_policy_artifacts(
         "calibration_approval_rate": float(base_policy["approval_rate"]),
         "calibration_review_rate": float(base_policy["review_rate"]),
         "calibration_decline_rate": float(base_policy["decline_rate"]),
+        "calibration_samples": calibration_samples,
+        "total_loan_amount": float(np.sum(loan_amount)),
+        "currency": "USD",
+        "calibration_cost_per_1000_applications": float(base_policy["cost"]) * cost_normalization,
         "selected_calibration_method": selected_method,
         "probability_source": probability_source,
         "selection_partition": "calibration",
@@ -424,27 +433,33 @@ def build_policy_artifacts(
             review_cost=review_cost,
         )
         optimal = scenario_search.iloc[0]
+        frozen_base_cost = policy_cost(
+            y_true,
+            loan_amount,
+            frozen_actions,
+            lgd=lgd,
+            margin=margin,
+            review_cost=review_cost,
+        )
         sensitivity_rows.append(
             {
                 "lgd": float(lgd),
                 "margin": float(margin),
                 "review_cost": float(review_cost),
+                "is_base_scenario": bool(
+                    lgd == base.lgd and margin == base.margin and review_cost == base.review_cost
+                ),
                 "optimal_approve_below": float(optimal["approve_below"]),
                 "optimal_decline_at": float(optimal["decline_at"]),
                 "optimal_cost": float(optimal["cost"]),
+                "optimal_cost_per_1000_applications": float(optimal["cost"]) * cost_normalization,
                 "optimal_approval_rate": float(optimal["approval_rate"]),
                 "optimal_review_rate": float(optimal["review_rate"]),
                 "optimal_decline_rate": float(optimal["decline_rate"]),
                 "base_approve_below": approve_below,
                 "base_decline_at": decline_at,
-                "frozen_base_cost": policy_cost(
-                    y_true,
-                    loan_amount,
-                    frozen_actions,
-                    lgd=lgd,
-                    margin=margin,
-                    review_cost=review_cost,
-                ),
+                "frozen_base_cost": frozen_base_cost,
+                "frozen_base_cost_per_1000_applications": frozen_base_cost * cost_normalization,
                 "frozen_base_approval_rate": frozen_rates["approval_rate"],
                 "frozen_base_review_rate": frozen_rates["review_rate"],
                 "frozen_base_decline_rate": frozen_rates["decline_rate"],

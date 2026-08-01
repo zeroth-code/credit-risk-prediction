@@ -46,6 +46,27 @@ class CostConfig(ConfigModel):
     margin_values: list[Probability] = Field(min_length=1)
     review_cost_values: list[NonnegativeCost] = Field(min_length=1)
 
+    @model_validator(mode="after")
+    def validate_sensitivity_grid(self) -> "CostConfig":
+        axes = (
+            ("lgd_values", self.lgd_values, "lgd", self.base.lgd),
+            ("margin_values", self.margin_values, "margin", self.base.margin),
+            (
+                "review_cost_values",
+                self.review_cost_values,
+                "review_cost",
+                self.base.review_cost,
+            ),
+        )
+        for values_field, values, base_field, base_value in axes:
+            if len(values) != 3:
+                raise ValueError(f"{values_field} must contain exactly 3 values")
+            if len(values) != len(set(values)):
+                raise ValueError(f"{values_field} values must be unique")
+            if base_value not in values:
+                raise ValueError(f"base.{base_field} must be included in {values_field}")
+        return self
+
 
 class ProjectConfig(ConfigModel):
     random_seed: StrictInt

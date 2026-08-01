@@ -9,9 +9,9 @@ from credit_risk.config import CostConfig, CostScenario, DateWindow, ProjectConf
 def _cost_config_payload() -> dict[str, object]:
     return {
         "base": {"lgd": 0.60, "margin": 0.05, "review_cost": 30.0},
-        "lgd_values": [0.60],
-        "margin_values": [0.05],
-        "review_cost_values": [30.0],
+        "lgd_values": [0.40, 0.60, 0.80],
+        "margin_values": [0.03, 0.05, 0.08],
+        "review_cost_values": [15.0, 30.0, 60.0],
     }
 
 
@@ -127,6 +127,65 @@ def test_cost_config_rejects_boolean_sensitivity_values(field: str) -> None:
 
     with pytest.raises(ValidationError):
         CostConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize("field", ["lgd_values", "margin_values", "review_cost_values"])
+@pytest.mark.parametrize("values", [[0.1, 0.2], [0.1, 0.2, 0.3, 0.4]])
+def test_cost_config_requires_exactly_three_values_per_sensitivity_axis(
+    field: str, values: list[float]
+) -> None:
+    payload = _cost_config_payload()
+    payload[field] = values
+
+    with pytest.raises(ValidationError, match=f"{field}.*exactly 3"):
+        CostConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "values"),
+    [
+        ("lgd_values", [0.40, 0.40, 0.60]),
+        ("margin_values", [0.03, 0.03, 0.05]),
+        ("review_cost_values", [15.0, 15.0, 30.0]),
+    ],
+)
+def test_cost_config_rejects_duplicate_sensitivity_values(field: str, values: list[float]) -> None:
+    payload = _cost_config_payload()
+    payload[field] = values
+
+    with pytest.raises(ValidationError, match=f"{field}.*unique"):
+        CostConfig.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("base_field", "values_field", "values"),
+    [
+        ("lgd", "lgd_values", [0.20, 0.40, 0.80]),
+        ("margin", "margin_values", [0.01, 0.03, 0.08]),
+        ("review_cost", "review_cost_values", [10.0, 15.0, 60.0]),
+    ],
+)
+def test_cost_config_requires_base_value_in_each_sensitivity_axis(
+    base_field: str, values_field: str, values: list[float]
+) -> None:
+    payload = _cost_config_payload()
+    payload[values_field] = values
+
+    with pytest.raises(ValidationError, match=f"base.{base_field}.*{values_field}"):
+        CostConfig.model_validate(payload)
+
+
+def test_cost_config_preserves_sensitivity_value_order() -> None:
+    payload = _cost_config_payload()
+    payload["lgd_values"] = [0.80, 0.40, 0.60]
+    payload["margin_values"] = [0.08, 0.03, 0.05]
+    payload["review_cost_values"] = [60.0, 15.0, 30.0]
+
+    config = CostConfig.model_validate(payload)
+
+    assert config.lgd_values == [0.80, 0.40, 0.60]
+    assert config.margin_values == [0.08, 0.03, 0.05]
+    assert config.review_cost_values == [60.0, 15.0, 30.0]
 
 
 @pytest.mark.parametrize("field", ["good_statuses", "bad_statuses"])

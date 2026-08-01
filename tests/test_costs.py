@@ -1,6 +1,8 @@
+import json
 from itertools import combinations
 
 import numpy as np
+import pandas as pd
 import pytest
 
 from credit_risk.costs import assign_actions, policy_cost, search_policy
@@ -45,6 +47,21 @@ def test_assign_actions_rejects_invalid_probabilities(
 
 
 @pytest.mark.parametrize(
+    "probabilities",
+    [
+        True,
+        np.bool_(False),
+        np.array([True]),
+        np.array([np.bool_(False)]),
+        np.array([0.2, True], dtype=object),
+    ],
+)
+def test_assign_actions_rejects_boolean_probabilities(probabilities: object) -> None:
+    with pytest.raises(ValueError, match="probabilities.*boolean"):
+        assign_actions(probabilities, approve_below=0.2, decline_at=0.7)
+
+
+@pytest.mark.parametrize(
     ("approve_below", "decline_at"),
     [
         (-0.01, 0.7),
@@ -61,6 +78,21 @@ def test_assign_actions_rejects_invalid_thresholds(approve_below: float, decline
             np.array([0.5]),
             approve_below=approve_below,
             decline_at=decline_at,
+        )
+
+
+@pytest.mark.parametrize(
+    ("approve_below", "decline_at"),
+    [(False, 0.7), (np.bool_(False), 0.7), (0.2, True), (0.2, np.bool_(True))],
+)
+def test_assign_actions_rejects_boolean_thresholds(
+    approve_below: object, decline_at: object
+) -> None:
+    with pytest.raises(ValueError, match="thresholds.*boolean"):
+        assign_actions(
+            np.array([0.5]),
+            approve_below=approve_below,  # type: ignore[arg-type]
+            decline_at=decline_at,  # type: ignore[arg-type]
         )
 
 
@@ -138,6 +170,21 @@ def test_policy_cost_rejects_non_binary_target(target: np.ndarray) -> None:
 
 
 @pytest.mark.parametrize(
+    "target", [True, np.bool_(False), np.array([True]), np.array([np.bool_(False)])]
+)
+def test_policy_cost_rejects_boolean_target(target: object) -> None:
+    with pytest.raises(ValueError, match="y_true.*boolean"):
+        policy_cost(
+            target,
+            np.array([1000.0]),
+            np.array(["approve"]),
+            lgd=0.6,
+            margin=0.05,
+            review_cost=30.0,
+        )
+
+
+@pytest.mark.parametrize(
     ("amounts", "message"),
     [
         (np.array(["invalid"]), "numeric"),
@@ -158,6 +205,21 @@ def test_policy_cost_rejects_invalid_loan_amounts(amounts: np.ndarray, message: 
         )
 
 
+@pytest.mark.parametrize(
+    "amounts", [True, np.bool_(False), np.array([True]), np.array([np.bool_(False)])]
+)
+def test_policy_cost_rejects_boolean_loan_amounts(amounts: object) -> None:
+    with pytest.raises(ValueError, match="loan_amount.*boolean"):
+        policy_cost(
+            np.array([0]),
+            amounts,
+            np.array(["approve"]),
+            lgd=0.6,
+            margin=0.05,
+            review_cost=30.0,
+        )
+
+
 @pytest.mark.parametrize("actions", [np.array(["refer"]), np.array([1])])
 def test_policy_cost_rejects_unknown_actions(actions: np.ndarray) -> None:
     with pytest.raises(ValueError, match="actions.*approve.*manual_review.*decline"):
@@ -165,6 +227,19 @@ def test_policy_cost_rejects_unknown_actions(actions: np.ndarray) -> None:
             np.array([0]),
             np.array([1000.0]),
             actions,
+            lgd=0.6,
+            margin=0.05,
+            review_cost=30.0,
+        )
+
+
+@pytest.mark.parametrize("action", [pd.NA, None, np.nan])
+def test_policy_cost_rejects_missing_actions_with_field_name(action: object) -> None:
+    with pytest.raises(ValueError, match="actions"):
+        policy_cost(
+            np.array([0]),
+            np.array([1000.0]),
+            np.array([action], dtype=object),
             lgd=0.6,
             margin=0.05,
             review_cost=30.0,
@@ -190,6 +265,21 @@ def test_policy_cost_rejects_invalid_cost_parameters(field: str, invalid_value: 
     costs[field] = invalid_value
 
     with pytest.raises(ValueError, match=field):
+        policy_cost(
+            np.array([0]),
+            np.array([1000.0]),
+            np.array(["approve"]),
+            **costs,
+        )
+
+
+@pytest.mark.parametrize("boolean", [True, False, np.bool_(True), np.bool_(False)])
+@pytest.mark.parametrize("field", ["lgd", "margin", "review_cost"])
+def test_policy_cost_rejects_boolean_cost_parameters(field: str, boolean: object) -> None:
+    costs = {"lgd": 0.6, "margin": 0.05, "review_cost": 30.0}
+    costs[field] = boolean
+
+    with pytest.raises(ValueError, match=f"{field}.*boolean"):
         policy_cost(
             np.array([0]),
             np.array([1000.0]),
@@ -241,13 +331,20 @@ def test_search_policy_uses_stable_grid_order_for_cost_ties() -> None:
         margin=0.0,
         review_cost=0.0,
     )
-    expected_pairs = np.array(list(combinations(np.linspace(0.05, 0.95, 19), 2)))
+    canonical_grid = np.arange(5, 100, 5, dtype=float) / 100.0
+    expected_pairs = np.array(list(combinations(canonical_grid, 2)))
 
     assert first.equals(second)
     assert np.array_equal(
         first[["approve_below", "decline_at"]].to_numpy(),
         expected_pairs,
     )
+    threshold_values = set(first[["approve_below", "decline_at"]].to_numpy().ravel())
+    assert 0.4 in threshold_values
+    assert 0.5 in threshold_values
+    threshold_records = first[["approve_below", "decline_at"]].to_dict(orient="records")
+    assert "0.39999999999999997" not in json.dumps(threshold_records)
+    assert "0.39999999999999997" not in first.to_csv(index=False)
 
 
 @pytest.mark.parametrize(
@@ -275,6 +372,32 @@ def test_search_policy_rejects_invalid_inputs(
     inputs[field] = invalid_value
 
     with pytest.raises(ValueError, match=message):
+        search_policy(**inputs)
+
+
+@pytest.mark.parametrize(
+    ("field", "boolean_value"),
+    [
+        ("y_true", np.array([True])),
+        ("loan_amount", np.array([np.bool_(False)])),
+        ("probabilities", np.array([True])),
+        ("lgd", np.bool_(True)),
+        ("margin", False),
+        ("review_cost", True),
+    ],
+)
+def test_search_policy_rejects_boolean_inputs(field: str, boolean_value: object) -> None:
+    inputs = {
+        "y_true": np.array([0]),
+        "loan_amount": np.array([1000.0]),
+        "probabilities": np.array([0.5]),
+        "lgd": 0.6,
+        "margin": 0.05,
+        "review_cost": 30.0,
+    }
+    inputs[field] = boolean_value
+
+    with pytest.raises(ValueError, match=f"{field}.*boolean"):
         search_policy(**inputs)
 
 

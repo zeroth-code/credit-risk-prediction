@@ -4,7 +4,21 @@ import pandas as pd
 ALLOWED_ACTIONS = ("approve", "manual_review", "decline")
 
 
+def _is_boolean(value: object) -> bool:
+    return isinstance(value, (bool, np.bool_))
+
+
+def _contains_boolean(values: np.ndarray) -> bool:
+    if np.issubdtype(values.dtype, np.bool_):
+        return True
+    if values.dtype == object:
+        return any(_is_boolean(value) for value in values)
+    return False
+
+
 def _one_dimensional_values(name: str, values: object) -> np.ndarray:
+    if _is_boolean(values):
+        raise ValueError(f"{name} must not be boolean")
     try:
         array = np.asarray(values)
     except (TypeError, ValueError) as exc:
@@ -18,6 +32,8 @@ def _one_dimensional_values(name: str, values: object) -> np.ndarray:
 
 def _validated_probabilities(probabilities: object) -> np.ndarray:
     values = _one_dimensional_values("probabilities", probabilities)
+    if _contains_boolean(values):
+        raise ValueError("probabilities must not contain boolean values")
     try:
         probability_array = values.astype(float)
     except (TypeError, ValueError) as exc:
@@ -31,6 +47,8 @@ def _validated_probabilities(probabilities: object) -> np.ndarray:
 
 def _validated_target(y_true: object) -> np.ndarray:
     target = _one_dimensional_values("y_true", y_true)
+    if _contains_boolean(target):
+        raise ValueError("y_true must not contain boolean values")
     try:
         binary = bool(np.isin(target, [0, 1]).all())
     except (TypeError, ValueError) as exc:
@@ -42,6 +60,8 @@ def _validated_target(y_true: object) -> np.ndarray:
 
 def _validated_loan_amount(loan_amount: object) -> np.ndarray:
     values = _one_dimensional_values("loan_amount", loan_amount)
+    if _contains_boolean(values):
+        raise ValueError("loan_amount must not contain boolean values")
     try:
         amounts = values.astype(float)
     except (TypeError, ValueError) as exc:
@@ -55,12 +75,20 @@ def _validated_loan_amount(loan_amount: object) -> np.ndarray:
 
 def _validated_actions(actions: object) -> np.ndarray:
     action_array = _one_dimensional_values("actions", actions)
-    if not np.isin(action_array, ALLOWED_ACTIONS).all():
+    if bool(pd.isna(action_array).any()):
+        raise ValueError("actions must not contain missing values")
+    try:
+        allowed = bool(np.isin(action_array, ALLOWED_ACTIONS).all())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("actions contain values that cannot be compared") from exc
+    if not allowed:
         raise ValueError("actions must contain only approve, manual_review, or decline")
     return action_array.astype(str, copy=False)
 
 
 def _validated_probability_cost(name: str, value: object) -> float:
+    if _is_boolean(value):
+        raise ValueError(f"{name} must not be boolean")
     try:
         parsed = float(value)
     except (TypeError, ValueError) as exc:
@@ -71,6 +99,8 @@ def _validated_probability_cost(name: str, value: object) -> float:
 
 
 def _validated_review_cost(review_cost: object) -> float:
+    if _is_boolean(review_cost):
+        raise ValueError("review_cost must not be boolean")
     try:
         parsed = float(review_cost)
     except (TypeError, ValueError) as exc:
@@ -81,6 +111,8 @@ def _validated_review_cost(review_cost: object) -> float:
 
 
 def _validated_thresholds(approve_below: object, decline_at: object) -> tuple[float, float]:
+    if _is_boolean(approve_below) or _is_boolean(decline_at):
+        raise ValueError("thresholds must not be boolean")
     try:
         approve_threshold = float(approve_below)
         decline_threshold = float(decline_at)
@@ -183,7 +215,7 @@ def search_policy(
     validated_margin = _validated_probability_cost("margin", margin)
     validated_review_cost = _validated_review_cost(review_cost)
 
-    grid = np.linspace(0.05, 0.95, 19)
+    grid = np.arange(5, 100, 5, dtype=float) / 100.0
     rows: list[dict[str, float]] = []
     for approve_index, approve_below in enumerate(grid[:-1]):
         for decline_at in grid[approve_index + 1 :]:
