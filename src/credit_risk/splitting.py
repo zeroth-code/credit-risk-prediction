@@ -1,47 +1,9 @@
-import re
 from collections.abc import Mapping
 from itertools import pairwise
-from pathlib import Path
 
 import pandas as pd
 
 from credit_risk.config import DateWindow
-
-REQUIRED_GENERATION_ARTIFACTS = (
-    "train.parquet",
-    "validation.parquet",
-    "calibration.parquet",
-    "test.parquet",
-    "population_audit.json",
-)
-
-
-def resolve_current_generation(processed_dir: str | Path) -> Path:
-    processed_path = Path(processed_dir)
-    current_path = processed_path / "CURRENT"
-    try:
-        pointer_content = current_path.read_text(encoding="utf-8")
-    except FileNotFoundError as error:
-        raise FileNotFoundError(f"CURRENT pointer not found: {current_path}") from error
-    if re.fullmatch(r"[0-9a-f]{32}\n", pointer_content) is None:
-        raise ValueError(
-            "CURRENT must contain a 32-character lowercase hexadecimal generation_id and newline"
-        )
-    generation_id = pointer_content[:-1]
-    generation_path = processed_path / "generations" / generation_id
-    if not generation_path.is_dir():
-        raise FileNotFoundError(f"current generation directory not found: {generation_path}")
-
-    missing_artifacts = [
-        artifact_name
-        for artifact_name in REQUIRED_GENERATION_ARTIFACTS
-        if not (generation_path / artifact_name).is_file()
-    ]
-    if missing_artifacts:
-        raise FileNotFoundError(
-            "current generation is missing required artifacts: " + ", ".join(missing_artifacts)
-        )
-    return generation_path
 
 
 def split_by_time(

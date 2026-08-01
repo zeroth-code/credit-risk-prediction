@@ -12,13 +12,12 @@ import pytest
 import yaml
 
 from credit_risk.config import DateWindow
-from credit_risk.splitting import (
-    REQUIRED_GENERATION_ARTIFACTS,
-    resolve_current_generation,
-    split_by_time,
-)
+from credit_risk.splitting import split_by_time
 
 PARTITION_NAMES = ("train", "validation", "calibration", "test")
+GENERATION_ARTIFACTS = tuple(f"{name}.parquet" for name in PARTITION_NAMES) + (
+    "population_audit.json",
+)
 
 
 def _windows() -> Mapping[str, DateWindow]:
@@ -55,7 +54,36 @@ def _write_generation(processed_dir: Path, generation_id: str, id_prefix: str) -
 
 def _set_current(processed_dir: Path, generation_id: str) -> None:
     processed_dir.mkdir(parents=True, exist_ok=True)
-    (processed_dir / "CURRENT").write_text(f"{generation_id}\n", encoding="utf-8")
+    (processed_dir / "CURRENT").symlink_to(
+        Path("generations") / generation_id, target_is_directory=True
+    )
+
+
+def _write_root_artifact_symlinks(
+    processed_dir: Path, *, exclude: frozenset[str] = frozenset()
+) -> None:
+    for artifact_name in GENERATION_ARTIFACTS:
+        if artifact_name not in exclude:
+            (processed_dir / artifact_name).symlink_to(Path("CURRENT") / artifact_name)
+
+
+def _activate_generation(processed_dir: Path, generation_id: str, id_prefix: str) -> Path:
+    generation_dir = _write_generation(processed_dir, generation_id, id_prefix)
+    _set_current(processed_dir, generation_id)
+    _write_root_artifact_symlinks(processed_dir)
+    return generation_dir
+
+
+def _current_generation(processed_dir: Path) -> Path:
+    return (processed_dir / "CURRENT").resolve(strict=True)
+
+
+def _assert_root_artifact_symlinks(processed_dir: Path) -> None:
+    for artifact_name in GENERATION_ARTIFACTS:
+        artifact_path = processed_dir / artifact_name
+        assert artifact_path.is_symlink()
+        assert artifact_path.readlink() == Path("CURRENT") / artifact_name
+        assert artifact_path.is_file()
 
 
 def _partition_ids(generation_dir: Path) -> dict[str, list[str]]:
@@ -63,56 +91,6 @@ def _partition_ids(generation_dir: Path) -> dict[str, list[str]]:
         name: pd.read_parquet(generation_dir / f"{name}.parquet")["id"].tolist()
         for name in PARTITION_NAMES
     }
-
-
-def test_resolve_current_generation_returns_complete_generation(tmp_path: Path) -> None:
-    generation_id = "a" * 32
-    generation_dir = tmp_path / "generations" / generation_id
-    generation_dir.mkdir(parents=True)
-    for artifact_name in REQUIRED_GENERATION_ARTIFACTS:
-        (generation_dir / artifact_name).touch()
-    (tmp_path / "CURRENT").write_text(f"{generation_id}\n", encoding="utf-8")
-
-    assert resolve_current_generation(tmp_path) == generation_dir
-
-
-@pytest.mark.parametrize(
-    "pointer_content",
-    ["../escape\n", f"{'A' * 32}\n", "a" * 32, f"{'a' * 32}\nextra\n"],
-)
-def test_resolve_current_generation_rejects_invalid_pointer_content(
-    tmp_path: Path, pointer_content: str
-) -> None:
-    (tmp_path / "CURRENT").write_text(pointer_content, encoding="utf-8")
-
-    with pytest.raises(ValueError, match="CURRENT|generation_id"):
-        resolve_current_generation(tmp_path)
-
-
-def test_resolve_current_generation_reports_missing_current_pointer(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError, match="CURRENT pointer not found"):
-        resolve_current_generation(tmp_path)
-
-
-def test_resolve_current_generation_reports_missing_generation_directory(tmp_path: Path) -> None:
-    generation_id = "b" * 32
-    (tmp_path / "CURRENT").write_text(f"{generation_id}\n", encoding="utf-8")
-
-    with pytest.raises(FileNotFoundError, match="generation directory"):
-        resolve_current_generation(tmp_path)
-
-
-def test_resolve_current_generation_reports_missing_required_artifacts(tmp_path: Path) -> None:
-    generation_id = "c" * 32
-    generation_dir = tmp_path / "generations" / generation_id
-    generation_dir.mkdir(parents=True)
-    for artifact_name in REQUIRED_GENERATION_ARTIFACTS:
-        if artifact_name != "test.parquet":
-            (generation_dir / artifact_name).touch()
-    (tmp_path / "CURRENT").write_text(f"{generation_id}\n", encoding="utf-8")
-
-    with pytest.raises(FileNotFoundError, match="test.parquet"):
-        resolve_current_generation(tmp_path)
 
 
 def test_split_by_time_creates_ordered_out_of_time_partitions() -> None:
@@ -254,8 +232,7 @@ def test_prepare_data_main_writes_partitions_and_population_audit(
 
     processed_dir = tmp_path / "nested" / "processed"
     old_generation_id = "0" * 32
-    old_generation_dir = _write_generation(processed_dir, old_generation_id, "old-")
-    _set_current(processed_dir, old_generation_id)
+    old_generation_dir = _activate_generation(processed_dir, old_generation_id, "old-")
     raw_csv = tmp_path / "raw.csv"
     audit_windows = {
         "train": DateWindow(start="2011-01-01", end="2013-12-31"),
@@ -312,10 +289,13 @@ def test_prepare_data_main_writes_partitions_and_population_audit(
 
     assert loaded_config_paths == ["configs/base.yaml"]
     assert loaded_raw_paths == [raw_csv]
-    generation_dir = resolve_current_generation(processed_dir)
+    current_path = processed_dir / "CURRENT"
+    generation_dir = _current_generation(processed_dir)
+    assert current_path.is_symlink()
+    assert current_path.readlink() == Path("generations") / generation_dir.name
     assert generation_dir != old_generation_dir
     assert old_generation_dir.is_dir()
-    assert (processed_dir / "CURRENT").read_text(encoding="utf-8") == f"{generation_dir.name}\n"
+    _assert_root_artifact_symlinks(processed_dir)
     expected_ids = {
         "train": "train",
         "validation": "validation",
@@ -323,14 +303,14 @@ def test_prepare_data_main_writes_partitions_and_population_audit(
         "test": "test",
     }
     for name, expected_id in expected_ids.items():
-        parquet_path = generation_dir / f"{name}.parquet"
+        parquet_path = processed_dir / f"{name}.parquet"
         partition = pd.read_parquet(parquet_path)
         parquet_pandas_metadata = json.loads(pq.read_metadata(parquet_path).metadata[b"pandas"])
 
         assert partition["id"].tolist() == [expected_id]
         assert parquet_pandas_metadata["index_columns"] == []
 
-    audit = json.loads((generation_dir / "population_audit.json").read_text(encoding="utf-8"))
+    audit = json.loads((processed_dir / "population_audit.json").read_text(encoding="utf-8"))
     assert audit == {
         "initial_rows": 6,
         "after_valid_ids": 6,
@@ -347,9 +327,6 @@ def test_prepare_data_main_writes_partitions_and_population_audit(
     assert audit["assigned_rows"] + audit["unassigned_rows"] == audit["final_rows"]
     assert audit["outside_window_rows"] + audit["window_gap_rows"] == audit["unassigned_rows"]
     assert not any(path.name.startswith(".") for path in (processed_dir / "generations").iterdir())
-    assert not any(
-        (processed_dir / artifact_name).exists() for artifact_name in REQUIRED_GENERATION_ARTIFACTS
-    )
 
 
 def test_prepare_data_script_runs_directly_from_another_working_directory(tmp_path: Path) -> None:
@@ -383,14 +360,77 @@ def test_prepare_data_script_runs_directly_from_another_working_directory(tmp_pa
     )
 
     assert result.returncode == 0, result.stderr
-    generation_dir = resolve_current_generation(processed_dir)
-    assert _partition_ids(generation_dir) == {
+    current_path = processed_dir / "CURRENT"
+    assert current_path.is_symlink()
+    generation_dir = _current_generation(processed_dir)
+    assert current_path.readlink() == Path("generations") / generation_dir.name
+    _assert_root_artifact_symlinks(processed_dir)
+    assert _partition_ids(processed_dir) == {
         "train": ["train"],
         "validation": ["validation"],
         "calibration": ["calibration"],
         "test": ["test"],
     }
-    assert (generation_dir / "population_audit.json").is_file()
+    assert (processed_dir / "population_audit.json").is_file()
+
+
+@pytest.mark.parametrize(
+    ("artifact_kind", "error_type", "error_message"),
+    [
+        ("regular", FileExistsError, "train.parquet"),
+        ("wrong_symlink", ValueError, "train.parquet"),
+    ],
+)
+def test_prepare_data_does_not_overwrite_unknown_root_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    artifact_kind: str,
+    error_type: type[Exception],
+    error_message: str,
+) -> None:
+    prepare_data = _load_prepare_data(f"prepare_data_{artifact_kind}_root_test")
+    processed_dir = tmp_path / "processed"
+    old_generation_id = "4" * 32
+    old_generation_dir = _write_generation(processed_dir, old_generation_id, "old-")
+    _set_current(processed_dir, old_generation_id)
+    _write_root_artifact_symlinks(processed_dir, exclude=frozenset({"train.parquet"}))
+    train_path = processed_dir / "train.parquet"
+    if artifact_kind == "regular":
+        train_path.write_text("user data", encoding="utf-8")
+        original_value: str | bytes = train_path.read_bytes()
+    else:
+        train_path.symlink_to("unexpected.parquet")
+        original_value = str(train_path.readlink())
+
+    config = SimpleNamespace(
+        raw_csv=tmp_path / "raw.csv",
+        processed_dir=processed_dir,
+        loan_term="36 months",
+        good_statuses=["Fully Paid"],
+        bad_statuses=["Charged Off", "Default"],
+        **_windows(),
+    )
+    raw = pd.DataFrame(
+        {
+            "id": ["new-train", "new-validation", "new-calibration", "new-test"],
+            "issue_d": ["Dec-2013", "Feb-2014", "Sep-2014", "Apr-2015"],
+            "term": [" 36 months"] * 4,
+            "loan_status": ["Fully Paid", "Charged Off", "Fully Paid", "Default"],
+            "loan_amnt": [10000, 12000, 8000, 9000],
+        }
+    )
+    monkeypatch.setattr(prepare_data, "load_config", lambda path: config)
+    monkeypatch.setattr(prepare_data, "load_raw_csv", lambda path: raw)
+
+    with pytest.raises(error_type, match=error_message):
+        prepare_data.main()
+
+    assert (processed_dir / "CURRENT").is_symlink()
+    assert _current_generation(processed_dir) == old_generation_dir
+    if artifact_kind == "regular":
+        assert train_path.read_bytes() == original_value
+    else:
+        assert str(train_path.readlink()) == original_value
 
 
 def test_prepare_data_preserves_published_artifacts_when_serialization_fails(
@@ -400,12 +440,13 @@ def test_prepare_data_preserves_published_artifacts_when_serialization_fails(
 
     processed_dir = tmp_path / "processed"
     old_generation_id = "1" * 32
-    old_generation_dir = _write_generation(processed_dir, old_generation_id, "old-")
-    _set_current(processed_dir, old_generation_id)
-    current_content = (processed_dir / "CURRENT").read_text(encoding="utf-8")
+    old_generation_dir = _activate_generation(processed_dir, old_generation_id, "old-")
+    current_path = processed_dir / "CURRENT"
+    current_target = current_path.readlink()
+    current_resolved = current_path.resolve(strict=True)
     original_artifacts = {
-        old_generation_dir / artifact_name: (old_generation_dir / artifact_name).read_bytes()
-        for artifact_name in REQUIRED_GENERATION_ARTIFACTS
+        processed_dir / artifact_name: (processed_dir / artifact_name).read_bytes()
+        for artifact_name in GENERATION_ARTIFACTS
     }
 
     config = SimpleNamespace(
@@ -444,8 +485,16 @@ def test_prepare_data_preserves_published_artifacts_when_serialization_fails(
     with pytest.raises(RuntimeError, match="injected parquet failure"):
         prepare_data.main()
 
-    assert (processed_dir / "CURRENT").read_text(encoding="utf-8") == current_content
-    assert resolve_current_generation(processed_dir) == old_generation_dir
+    assert current_path.is_symlink()
+    assert current_path.readlink() == current_target
+    assert current_path.resolve(strict=True) == current_resolved == old_generation_dir
+    _assert_root_artifact_symlinks(processed_dir)
+    assert _partition_ids(processed_dir) == {
+        "train": ["old-train"],
+        "validation": ["old-validation"],
+        "calibration": ["old-calibration"],
+        "test": ["old-test"],
+    }
     assert {path: path.read_bytes() for path in original_artifacts} == original_artifacts
     attempted_directories = {path.parent for path in attempted_paths}
     assert len(attempted_directories) == 1
@@ -461,9 +510,10 @@ def test_prepare_data_keeps_current_generation_when_pointer_publication_fails(
     prepare_data = _load_prepare_data("prepare_data_pointer_failure_test")
     processed_dir = tmp_path / "processed"
     old_generation_id = "2" * 32
-    old_generation_dir = _write_generation(processed_dir, old_generation_id, "old-")
-    _set_current(processed_dir, old_generation_id)
-    current_content = (processed_dir / "CURRENT").read_text(encoding="utf-8")
+    old_generation_dir = _activate_generation(processed_dir, old_generation_id, "old-")
+    current_path = processed_dir / "CURRENT"
+    current_target = current_path.readlink()
+    current_resolved = current_path.resolve(strict=True)
 
     config = SimpleNamespace(
         raw_csv=tmp_path / "raw.csv",
@@ -497,9 +547,11 @@ def test_prepare_data_keeps_current_generation_when_pointer_publication_fails(
     with pytest.raises(OSError, match="CURRENT replace failure"):
         prepare_data.main()
 
-    assert (processed_dir / "CURRENT").read_text(encoding="utf-8") == current_content
-    assert resolve_current_generation(processed_dir) == old_generation_dir
-    assert _partition_ids(resolve_current_generation(processed_dir)) == {
+    assert current_path.is_symlink()
+    assert current_path.readlink() == current_target
+    assert current_path.resolve(strict=True) == current_resolved == old_generation_dir
+    _assert_root_artifact_symlinks(processed_dir)
+    assert _partition_ids(processed_dir) == {
         "train": ["old-train"],
         "validation": ["old-validation"],
         "calibration": ["old-calibration"],
@@ -517,9 +569,10 @@ def test_prepare_data_keeps_current_generation_when_generation_publication_fails
     prepare_data = _load_prepare_data("prepare_data_generation_failure_test")
     processed_dir = tmp_path / "processed"
     old_generation_id = "3" * 32
-    old_generation_dir = _write_generation(processed_dir, old_generation_id, "old-")
-    _set_current(processed_dir, old_generation_id)
-    current_content = (processed_dir / "CURRENT").read_text(encoding="utf-8")
+    old_generation_dir = _activate_generation(processed_dir, old_generation_id, "old-")
+    current_path = processed_dir / "CURRENT"
+    current_target = current_path.readlink()
+    current_resolved = current_path.resolve(strict=True)
 
     config = SimpleNamespace(
         raw_csv=tmp_path / "raw.csv",
@@ -554,9 +607,11 @@ def test_prepare_data_keeps_current_generation_when_generation_publication_fails
     with pytest.raises(OSError, match="generation replace failure"):
         prepare_data.main()
 
-    assert (processed_dir / "CURRENT").read_text(encoding="utf-8") == current_content
-    assert resolve_current_generation(processed_dir) == old_generation_dir
-    assert _partition_ids(old_generation_dir) == {
+    assert current_path.is_symlink()
+    assert current_path.readlink() == current_target
+    assert current_path.resolve(strict=True) == current_resolved == old_generation_dir
+    _assert_root_artifact_symlinks(processed_dir)
+    assert _partition_ids(processed_dir) == {
         "train": ["old-train"],
         "validation": ["old-validation"],
         "calibration": ["old-calibration"],

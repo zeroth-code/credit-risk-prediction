@@ -14,6 +14,39 @@ from credit_risk.config import load_config  # noqa: E402
 from credit_risk.data import build_modeling_population, load_raw_csv  # noqa: E402
 from credit_risk.splitting import split_by_time  # noqa: E402
 
+GENERATION_ARTIFACTS = (
+    "train.parquet",
+    "validation.parquet",
+    "calibration.parquet",
+    "test.parquet",
+    "population_audit.json",
+)
+
+
+def _ensure_root_artifact_symlinks(processed_dir: Path, generation_id: str) -> None:
+    missing_paths: list[tuple[Path, Path]] = []
+    for artifact_name in GENERATION_ARTIFACTS:
+        artifact_path = processed_dir / artifact_name
+        expected_target = Path("CURRENT") / artifact_name
+        if artifact_path.is_symlink():
+            actual_target = artifact_path.readlink()
+            if actual_target != expected_target:
+                raise ValueError(
+                    f"root artifact symlink {artifact_path} points to {actual_target}, "
+                    f"expected {expected_target}"
+                )
+        elif artifact_path.exists():
+            raise FileExistsError(
+                f"root artifact path exists and is not a symlink: {artifact_path}"
+            )
+        else:
+            missing_paths.append((artifact_path, expected_target))
+
+    for artifact_path, expected_target in missing_paths:
+        temporary_path = processed_dir / f".{artifact_path.name}.{generation_id}.tmp"
+        temporary_path.symlink_to(expected_target, target_is_directory=False)
+        temporary_path.replace(artifact_path)
+
 
 def main() -> None:
     config = load_config("configs/base.yaml")
@@ -83,8 +116,9 @@ def main() -> None:
         json.dump(audit, audit_file, indent=2)
 
     staging_dir.replace(generation_dir)
+    _ensure_root_artifact_symlinks(config.processed_dir, generation_id)
     temporary_current = config.processed_dir / f".CURRENT.{generation_id}.tmp"
-    temporary_current.write_text(f"{generation_id}\n", encoding="utf-8")
+    temporary_current.symlink_to(Path("generations") / generation_id, target_is_directory=True)
     temporary_current.replace(config.processed_dir / "CURRENT")
 
 
