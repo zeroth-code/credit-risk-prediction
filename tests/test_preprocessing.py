@@ -1,13 +1,16 @@
 from collections.abc import Callable
+from pathlib import Path
 
+import joblib
 import numpy as np
 import pandas as pd
 import pytest
 from scipy.sparse import issparse
+from sklearn.base import clone
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 from credit_risk.features import make_logistic_preprocessor, make_tree_preprocessor
 
@@ -35,19 +38,12 @@ def test_make_logistic_preprocessor_builds_expected_pipelines() -> None:
 
     numeric_pipeline, configured_numeric = transformers["numeric"]
     assert isinstance(numeric_pipeline, Pipeline)
-    assert list(numeric_pipeline.named_steps) == [
-        "normalize_numeric",
-        "imputer",
-        "scaler",
-    ]
-    numeric_normalizer = numeric_pipeline.named_steps["normalize_numeric"]
-    assert isinstance(numeric_normalizer, FunctionTransformer)
-    assert numeric_normalizer.validate is False
-    assert numeric_normalizer.feature_names_out == "one-to-one"
+    assert list(numeric_pipeline.named_steps) == ["imputer", "scaler"]
     assert isinstance(numeric_pipeline.named_steps["imputer"], SimpleImputer)
     assert numeric_pipeline.named_steps["imputer"].strategy == "median"
     assert numeric_pipeline.named_steps["imputer"].keep_empty_features is True
     assert np.isnan(numeric_pipeline.named_steps["imputer"].missing_values)
+    assert numeric_pipeline.named_steps["imputer"].get_params(deep=False) == {}
     assert isinstance(numeric_pipeline.named_steps["scaler"], StandardScaler)
     assert configured_numeric == numeric_columns
 
@@ -111,15 +107,12 @@ def test_make_tree_preprocessor_builds_expected_pipelines() -> None:
 
     numeric_pipeline, configured_numeric = transformers["numeric"]
     assert isinstance(numeric_pipeline, Pipeline)
-    assert list(numeric_pipeline.named_steps) == ["normalize_numeric", "imputer"]
-    numeric_normalizer = numeric_pipeline.named_steps["normalize_numeric"]
-    assert isinstance(numeric_normalizer, FunctionTransformer)
-    assert numeric_normalizer.validate is False
-    assert numeric_normalizer.feature_names_out == "one-to-one"
+    assert list(numeric_pipeline.named_steps) == ["imputer"]
     assert isinstance(numeric_pipeline.named_steps["imputer"], SimpleImputer)
     assert numeric_pipeline.named_steps["imputer"].strategy == "median"
     assert numeric_pipeline.named_steps["imputer"].keep_empty_features is True
     assert np.isnan(numeric_pipeline.named_steps["imputer"].missing_values)
+    assert numeric_pipeline.named_steps["imputer"].get_params(deep=False) == {}
     assert "scaler" not in numeric_pipeline.named_steps
     assert configured_numeric == numeric_columns
 
@@ -365,14 +358,12 @@ def test_preprocessor_parses_numeric_strings_and_percent_literals(
     preprocessor = factory(["loan_amnt", "int_rate"], [])
 
     preprocessor.fit(train)
-    normalizer = preprocessor.named_transformers_["numeric"].named_steps["normalize_numeric"]
-    normalized_train = normalizer.transform(train)
+    imputer = preprocessor.named_transformers_["numeric"].named_steps["imputer"]
+    normalized_train = imputer.transform(train)
     future_result = preprocessor.transform(future)
 
-    assert isinstance(normalized_train, pd.DataFrame)
-    assert normalized_train.columns.tolist() == ["loan_amnt", "int_rate"]
     np.testing.assert_allclose(
-        normalized_train.to_numpy(),
+        normalized_train,
         [[10_000.0, 13.5], [12_000.5, 7.0]],
     )
     assert future_result.shape == (1, 2)
@@ -398,6 +389,26 @@ def test_preprocessor_rejects_unparseable_numeric_values_with_column_context(
     message = str(error.value)
     assert "loan_amnt" in message
     assert "not-a-number" in message
+
+
+@pytest.mark.parametrize("factory", PREPROCESSOR_FACTORIES)
+@pytest.mark.parametrize("invalid_value", [np.inf, -np.inf, "inf", "-inf"])
+def test_preprocessor_rejects_non_finite_numeric_values_with_column_context(
+    factory: PreprocessorFactory,
+    invalid_value: object,
+) -> None:
+    frame = pd.DataFrame(
+        {"loan_amnt": [10_000.0, invalid_value]},
+        dtype="object",
+    )
+    preprocessor = factory(["loan_amnt"], [])
+
+    with pytest.raises(ValueError) as error:
+        preprocessor.fit(frame)
+
+    message = str(error.value)
+    assert "loan_amnt" in message
+    assert str(invalid_value) in message
 
 
 @pytest.mark.parametrize("factory", PREPROCESSOR_FACTORIES)
@@ -537,3 +548,76 @@ def test_preprocessor_factory_snapshots_column_selectors(
         )
     )
     assert result.shape[0] == 2
+
+
+@pytest.mark.parametrize("factory", PREPROCESSOR_FACTORIES)
+def test_fitted_preprocessor_survives_joblib_round_trip(
+    factory: PreprocessorFactory,
+    tmp_path: Path,
+) -> None:
+    train = pd.DataFrame(
+        {
+            "loan_amnt": ["10000", pd.NA, "12000"],
+            "int_rate": ["13.5%", " 7 % ", None],
+            "purpose": ["debt_consolidation", None, "credit_card"],
+        },
+        dtype="object",
+    )
+    future = pd.DataFrame(
+        {
+            "loan_amnt": ["14000"],
+            "int_rate": ["9.25%"],
+            "purpose": ["medical"],
+        },
+        dtype="object",
+    )
+    preprocessor = factory(["loan_amnt", "int_rate"], ["purpose"])
+    preprocessor.fit(train)
+    expected = preprocessor.transform(future)
+    expected_names = preprocessor.get_feature_names_out()
+    artifact_path = tmp_path / "preprocessor.joblib"
+
+    joblib.dump(preprocessor, artifact_path)
+    loaded = joblib.load(artifact_path)
+    actual = loaded.transform(future)
+
+    np.testing.assert_allclose(actual, expected)
+    assert loaded.get_feature_names_out().tolist() == expected_names.tolist()
+
+
+@pytest.mark.parametrize("factory", PREPROCESSOR_FACTORIES)
+def test_preprocessor_and_numeric_imputer_are_sklearn_clone_compatible(
+    factory: PreprocessorFactory,
+) -> None:
+    preprocessor = factory(["loan_amnt"], ["purpose"])
+    cloned = clone(preprocessor)
+    frame = pd.DataFrame(
+        {
+            "loan_amnt": ["10000", pd.NA, "12000"],
+            "purpose": ["debt_consolidation", None, "credit_card"],
+        },
+        dtype="object",
+    )
+
+    result = cloned.fit_transform(frame)
+
+    assert result.shape[0] == len(frame)
+    assert np.isfinite(result).all()
+
+
+@pytest.mark.parametrize("factory", PREPROCESSOR_FACTORIES)
+def test_preprocessor_handles_large_vectorized_numeric_input(
+    factory: PreprocessorFactory,
+) -> None:
+    row_count = 10_000
+    loan_amnt = pd.Series(np.arange(1_000, 1_000 + row_count), dtype="string")
+    int_rate = pd.Series(np.arange(row_count) % 20 + 1, dtype="string") + "%"
+    loan_amnt.iloc[::17] = pd.NA
+    int_rate.iloc[::19] = pd.NA
+    frame = pd.DataFrame({"loan_amnt": loan_amnt, "int_rate": int_rate})
+    preprocessor = factory(["loan_amnt", "int_rate"], [])
+
+    result = preprocessor.fit_transform(frame)
+
+    assert result.shape == (row_count, 2)
+    assert np.isfinite(result).all()

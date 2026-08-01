@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 DEFAULT_FEATURE_PATH = Path("configs/features.yaml")
 FeatureName = Annotated[
@@ -85,29 +85,43 @@ def _normalize_numeric(values: pd.DataFrame | np.ndarray) -> pd.DataFrame | np.n
     for column in frame.columns:
         original = frame[column]
         missing = original.isna()
-        prepared = original.astype(object).copy()
-        for position, is_missing in enumerate(missing.to_numpy()):
-            if is_missing:
-                prepared.iloc[position] = np.nan
-                continue
-
-            value = prepared.iloc[position]
-            if isinstance(value, str):
-                value = value.strip()
-                if value.endswith("%"):
-                    value = value[:-1].strip()
-                prepared.iloc[position] = value
-
-        converted = pd.to_numeric(prepared, errors="coerce")
-        invalid = ~missing & converted.isna()
+        text = original.astype("string").str.strip()
+        has_percent_suffix = text.str.endswith("%", na=False)
+        text = text.mask(
+            has_percent_suffix,
+            text.str.removesuffix("%").str.strip(),
+        )
+        converted = pd.to_numeric(text, errors="coerce")
+        converted_values = converted.to_numpy(dtype=float, na_value=np.nan)
+        invalid = ~missing.to_numpy() & ~np.isfinite(converted_values)
         if invalid.any():
-            representative = original.loc[invalid].iloc[0]
+            representative = original.iloc[np.flatnonzero(invalid)[0]]
             raise ValueError(f"invalid numeric value in column {column!r}: {representative!r}")
-        normalized[column] = converted.astype(float)
+        normalized[column] = converted_values
 
     if is_frame:
         return normalized
     return normalized.to_numpy(dtype=float).reshape(original_shape)
+
+
+class _NumericSimpleImputer(SimpleImputer):
+    def __init__(self) -> None:
+        super().__init__(
+            missing_values=np.nan,
+            strategy="median",
+            keep_empty_features=True,
+        )
+
+    def fit(
+        self,
+        X: pd.DataFrame | np.ndarray,
+        y: object | None = None,
+    ) -> "_NumericSimpleImputer":
+        super().fit(_normalize_numeric(X), y)
+        return self
+
+    def transform(self, X: pd.DataFrame | np.ndarray) -> np.ndarray:
+        return super().transform(_normalize_numeric(X))
 
 
 def make_logistic_preprocessor(
@@ -117,22 +131,7 @@ def make_logistic_preprocessor(
     _validate_preprocessor_columns(numeric_columns, categorical_columns)
     numeric_pipeline = Pipeline(
         steps=[
-            (
-                "normalize_numeric",
-                FunctionTransformer(
-                    _normalize_numeric,
-                    validate=False,
-                    feature_names_out="one-to-one",
-                ),
-            ),
-            (
-                "imputer",
-                SimpleImputer(
-                    missing_values=np.nan,
-                    strategy="median",
-                    keep_empty_features=True,
-                ),
-            ),
+            ("imputer", _NumericSimpleImputer()),
             ("scaler", StandardScaler()),
         ]
     )
@@ -154,26 +153,7 @@ def make_tree_preprocessor(
     categorical_columns: list[str],
 ) -> ColumnTransformer:
     _validate_preprocessor_columns(numeric_columns, categorical_columns)
-    numeric_pipeline = Pipeline(
-        steps=[
-            (
-                "normalize_numeric",
-                FunctionTransformer(
-                    _normalize_numeric,
-                    validate=False,
-                    feature_names_out="one-to-one",
-                ),
-            ),
-            (
-                "imputer",
-                SimpleImputer(
-                    missing_values=np.nan,
-                    strategy="median",
-                    keep_empty_features=True,
-                ),
-            ),
-        ]
-    )
+    numeric_pipeline = Pipeline(steps=[("imputer", _NumericSimpleImputer())])
     return ColumnTransformer(
         transformers=[
             ("numeric", numeric_pipeline, list(numeric_columns)),
