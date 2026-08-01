@@ -34,9 +34,18 @@ def binary_metrics(
 
     if len(y_array) != len(probability_values):
         raise ValueError("y_true and probabilities must have the same length")
-    if not np.isin(y_array, [0, 1]).all():
+    try:
+        contains_only_binary_values = bool(np.isin(y_array, [0, 1]).all())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("y_true values must be 0 or 1") from exc
+    if not contains_only_binary_values:
         raise ValueError("y_true values must be 0 or 1")
-    if not np.any(y_array == 0) or not np.any(y_array == 1):
+    try:
+        has_zero = bool(np.any(y_array == 0))
+        has_one = bool(np.any(y_array == 1))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("y_true values must be 0 or 1") from exc
+    if not has_zero or not has_one:
         raise ValueError("y_true must contain both classes 0 and 1 for ROC AUC and KS")
 
     try:

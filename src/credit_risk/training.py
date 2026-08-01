@@ -4,6 +4,8 @@ from lightgbm import LGBMClassifier
 from sklearn.dummy import DummyClassifier
 from sklearn.linear_model import LogisticRegression
 
+_RESERVED_LIGHTGBM_OVERRIDE_KEYS = ("objective", "n_jobs", "random_state")
+
 
 def _validate_random_seed(random_seed: int) -> None:
     if not isinstance(random_seed, int) or isinstance(random_seed, bool):
@@ -39,6 +41,11 @@ def make_lightgbm_model(
         or scale_pos_weight <= 0
     ):
         raise ValueError("scale_pos_weight must be finite and greater than 0")
+
+    conflicting_keys = [key for key in _RESERVED_LIGHTGBM_OVERRIDE_KEYS if key in overrides]
+    if conflicting_keys:
+        joined_keys = ", ".join(conflicting_keys)
+        raise ValueError(f"reserved/conflicting LightGBM override keys: {joined_keys}")
 
     params: dict[str, object] = {
         "objective": "binary",

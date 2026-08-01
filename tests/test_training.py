@@ -60,13 +60,44 @@ def test_make_lightgbm_model_applies_overrides_without_losing_explicit_inputs() 
         scale_pos_weight=3.0,
         n_estimators=7,
         learning_rate=0.2,
+        num_leaves=15,
     )
 
     params = model.get_params()
     assert params["n_estimators"] == 7
     assert params["learning_rate"] == pytest.approx(0.2)
+    assert params["num_leaves"] == 15
     assert params["random_state"] == 31
     assert params["scale_pos_weight"] == pytest.approx(3.0)
+
+
+@pytest.mark.parametrize(
+    ("reserved_key", "value"),
+    [
+        ("objective", "multiclass"),
+        ("n_jobs", 1),
+        ("random_state", 99),
+    ],
+)
+def test_make_lightgbm_model_rejects_each_reserved_override(
+    reserved_key: str, value: object
+) -> None:
+    with pytest.raises(ValueError, match=rf"reserved/conflicting.*{reserved_key}"):
+        make_lightgbm_model(random_seed=11, **{reserved_key: value})  # type: ignore[arg-type]
+
+
+def test_make_lightgbm_model_lists_all_reserved_overrides_in_stable_order() -> None:
+    with pytest.raises(ValueError) as exc_info:
+        make_lightgbm_model(
+            random_seed=11,
+            random_state=99,
+            objective="multiclass",  # type: ignore[arg-type]
+            n_jobs=1,
+        )
+
+    assert str(exc_info.value) == (
+        "reserved/conflicting LightGBM override keys: objective, n_jobs, random_state"
+    )
 
 
 def test_factories_return_independent_model_instances() -> None:

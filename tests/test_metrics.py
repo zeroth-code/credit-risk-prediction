@@ -1,4 +1,5 @@
 import numpy as np
+import pandas as pd
 import pytest
 
 from credit_risk.metrics import binary_metrics
@@ -55,6 +56,42 @@ def test_binary_metrics_threshold_is_inclusive() -> None:
 
     assert result["tn"] == 1.0
     assert result["tp"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "y_true",
+    [
+        (0, 1),
+        (0.0, 1.0),
+        pd.Series([0, 1]),
+    ],
+    ids=["tuple", "float-values", "series"],
+)
+def test_binary_metrics_accepts_supported_one_dimensional_targets(y_true: object) -> None:
+    result = binary_metrics(y_true, [0.2, 0.8], threshold=0.5)  # type: ignore[arg-type]
+
+    assert result["roc_auc"] == 1.0
+    assert result["tn"] == 1.0
+    assert result["tp"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "y_true",
+    [
+        np.array([0, pd.NA], dtype=object),
+        [0, None],
+        [0, np.nan],
+    ],
+    ids=["pandas-na", "none", "nan"],
+)
+def test_binary_metrics_normalizes_invalid_object_targets_to_value_error(y_true: object) -> None:
+    with pytest.raises(ValueError, match="y_true values must be 0 or 1"):
+        binary_metrics(y_true, [0.2, 0.8], threshold=0.5)  # type: ignore[arg-type]
+
+
+def test_binary_metrics_rejects_string_binary_labels() -> None:
+    with pytest.raises(ValueError, match="y_true values must be 0 or 1"):
+        binary_metrics(["0", "1"], [0.2, 0.8], threshold=0.5)  # type: ignore[list-item]
 
 
 @pytest.mark.parametrize(
