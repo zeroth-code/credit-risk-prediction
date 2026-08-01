@@ -31,6 +31,10 @@ def build_modeling_population(
     result = frame.copy()
     audit = {"initial_rows": len(result)}
 
+    result["id"] = result["id"].astype("string").str.strip()
+    result = result.loc[result["id"].notna() & result["id"].ne("")].copy()
+    audit["after_valid_ids"] = len(result)
+
     result["term"] = result["term"].astype("string").str.strip()
     result["issue_d"] = parse_issue_date(result["issue_d"])
 

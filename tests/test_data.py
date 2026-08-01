@@ -125,8 +125,34 @@ def test_build_modeling_population_removes_all_duplicates_and_audits_each_stage(
     assert result["id"].tolist() == ["2", "0", "1"]
     assert audit == {
         "initial_rows": 8,
+        "after_valid_ids": 8,
         "after_duplicates": 6,
         "after_valid_dates": 5,
         "after_term_filter": 4,
         "final_rows": 3,
     }
+
+
+def test_build_modeling_population_normalizes_and_filters_ids_before_deduplication() -> None:
+    frame = pd.DataFrame(
+        {
+            "id": [None, pd.NA, "", "   ", " keep ", "duplicate", " duplicate "],
+            "issue_d": ["Jan-2013"] * 7,
+            "term": [" 36 months"] * 7,
+            "loan_status": ["Fully Paid"] * 7,
+            "loan_amnt": [10000] * 7,
+        }
+    )
+    original = frame.copy(deep=True)
+
+    result, audit = build_modeling_population(
+        frame,
+        term="36 months",
+        good_statuses=["Fully Paid"],
+        bad_statuses=["Charged Off", "Default"],
+    )
+
+    assert_frame_equal(frame, original)
+    assert result["id"].tolist() == ["keep"]
+    assert audit["after_valid_ids"] == 3
+    assert audit["after_duplicates"] == 1

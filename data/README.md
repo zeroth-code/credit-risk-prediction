@@ -12,9 +12,9 @@ Git.
 
 ## Verification
 
-After downloading the file, run `scripts/hash_file.py` and record its SHA-256 in the
-published data card. Any hash change requires rerunning the complete data and modeling
-workflow. The verification script is added in a later task.
+The helper script is not currently available. Once `scripts/hash_file.py` is provided, run
+it after downloading the file and record its SHA-256 in the published data card. Any hash
+change requires rerunning the complete data and modeling workflow.
 
 ## Modeling Population
 
