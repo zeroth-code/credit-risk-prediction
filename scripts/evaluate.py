@@ -25,6 +25,7 @@ CLASSIFICATION_THRESHOLD = 0.5
 BOOTSTRAP_SAMPLES = 1000
 BOOTSTRAP_CONFIDENCE_LEVEL = 0.95
 BOOTSTRAP_INTERVAL_METHOD = "percentile"
+BOOTSTRAP_POINT_ESTIMATE_INCLUDED = True
 BOOTSTRAP_RESAMPLING = "stratified_with_replacement"
 ECE_BINS = 10
 ECE_BINNING = "equal_width"
@@ -499,6 +500,7 @@ def main(
             "samples": BOOTSTRAP_SAMPLES,
             "confidence_level": BOOTSTRAP_CONFIDENCE_LEVEL,
             "interval_method": BOOTSTRAP_INTERVAL_METHOD,
+            "point_estimate_included": BOOTSTRAP_POINT_ESTIMATE_INCLUDED,
             "resampling": BOOTSTRAP_RESAMPLING,
             "random_seed": config.random_seed,
         },

@@ -158,8 +158,11 @@ def bootstrap_metric(
         )
         bootstrap_values[sample_index] = metric(target[indices], probability_array[indices])
 
+    estimate = float(metric(target, probability_array))
+    percentile_lower = float(np.quantile(bootstrap_values, 0.025))
+    percentile_upper = float(np.quantile(bootstrap_values, 0.975))
     return {
-        "estimate": float(metric(target, probability_array)),
-        "lower": float(np.quantile(bootstrap_values, 0.025)),
-        "upper": float(np.quantile(bootstrap_values, 0.975)),
+        "estimate": estimate,
+        "lower": min(percentile_lower, estimate),
+        "upper": max(percentile_upper, estimate),
     }

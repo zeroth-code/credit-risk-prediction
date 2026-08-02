@@ -15,6 +15,19 @@ def test_bootstrap_metric_is_reproducible() -> None:
     assert first["lower"] <= first["estimate"] <= first["upper"]
 
 
+def test_bootstrap_metric_interval_always_includes_point_estimate() -> None:
+    result = bootstrap_metric(
+        np.array([0, 0, 1, 1]),
+        np.array([0.1, 0.8, 0.7, 0.9]),
+        metric_name="roc_auc",
+        samples=1,
+        random_seed=1,
+    )
+
+    assert result["estimate"] == 0.75
+    assert result["lower"] <= result["estimate"] <= result["upper"]
+
+
 @pytest.mark.parametrize("metric_name", ["roc-auc", "pr_auc", "log_loss", "ROC_AUC"])
 def test_bootstrap_metric_rejects_unsupported_metric(metric_name: str) -> None:
     with pytest.raises(ValueError, match="metric_name.*roc_auc.*average_precision.*brier_score"):

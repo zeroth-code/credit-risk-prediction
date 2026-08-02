@@ -358,6 +358,7 @@ def test_evaluate_uses_only_frozen_test_artifacts_and_writes_stable_schemas(
         "samples": 1000,
         "confidence_level": 0.95,
         "interval_method": "percentile",
+        "point_estimate_included": True,
         "resampling": "stratified_with_replacement",
         "random_seed": 17,
     }
