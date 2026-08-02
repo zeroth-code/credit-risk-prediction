@@ -13,6 +13,8 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from sklearn.metrics import brier_score_loss, confusion_matrix, log_loss  # noqa: E402
 
+from credit_risk import __version__  # noqa: E402
+from credit_risk.artifacts import create_release_bundle, sha256_file  # noqa: E402
 from credit_risk.calibration import expected_calibration_error  # noqa: E402
 from credit_risk.config import load_config  # noqa: E402
 from credit_risk.costs import assign_actions, policy_cost  # noqa: E402
@@ -408,6 +410,9 @@ def main(
     resolved_config_path = _project_path(config_path)
     resolved_feature_path = _project_path(feature_dictionary_path)
     config = load_config(resolved_config_path)
+    raw_csv_path = _project_path(config.raw_csv)
+    _require_file(raw_csv_path, "raw data snapshot")
+    data_hash = sha256_file(raw_csv_path)
     feature_dictionary = load_feature_dictionary(resolved_feature_path)
     challenger = feature_dictionary["challenger"]
     selected_columns = list(challenger["numeric"]) + list(challenger["categorical"])  # type: ignore[index]
@@ -622,6 +627,13 @@ def main(
         )
     _write_json(artifact_dir / "fairness_summary.json", fairness_summary)
     scored.to_parquet(artifact_dir / "scored_test.parquet", index=False)
+    create_release_bundle(
+        artifact_dir,
+        artifact_dir / "release",
+        version=__version__,
+        feature_set="challenger",
+        data_hash=data_hash,
+    )
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

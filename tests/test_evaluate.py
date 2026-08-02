@@ -14,6 +14,7 @@ import yaml
 from lightgbm import LGBMClassifier
 from sklearn.linear_model import LogisticRegression
 
+from credit_risk.artifacts import sha256_file, validate_release_bundle
 from credit_risk.calibration import expected_calibration_error as real_expected_calibration_error
 from credit_risk.costs import assign_actions
 from credit_risk.features import make_tree_preprocessor
@@ -139,6 +140,32 @@ FAIRNESS_COLUMNS = [
     "brier_score",
     "suppressed",
 ]
+RELEASE_SOURCE_NAMES = {
+    "calibrated_model.joblib",
+    "preprocessor.joblib",
+    "policy.json",
+    "validation_metrics.json",
+    "calibration_metrics.json",
+    "calibration_curve.csv",
+    "cost_sensitivity.csv",
+    "final_test_metrics.json",
+    "confusion_matrix.csv",
+    "policy_test_results.json",
+    "temporal_metrics.csv",
+    "fairness_income.csv",
+    "fairness_home_ownership.csv",
+    "fairness_region.csv",
+    "fairness_employment.csv",
+    "fairness_summary.json",
+    "shap_importance.csv",
+    "shap_explanations.json",
+}
+PROHIBITED_RELEASE_NAMES = {
+    "tuning_trials.csv",
+    "uncalibrated_model.joblib",
+    "scored_test.parquet",
+    "accepted_2007_to_2018Q4.csv",
+}
 
 
 class FitForbiddenPreprocessor:
@@ -199,11 +226,16 @@ def _write_test_environment(
     forbid_fit: bool,
 ) -> tuple[Path, Path, Path, Path, pd.DataFrame, dict[str, object]]:
     processed_dir = root / "data/processed"
+    raw_dir = root / "data/raw"
     artifact_dir = root / "artifacts"
     config_dir = root / "configs"
     processed_dir.mkdir(parents=True)
+    raw_dir.mkdir(parents=True)
     artifact_dir.mkdir(parents=True)
     config_dir.mkdir(parents=True)
+
+    raw_path = raw_dir / "raw_snapshot.csv"
+    raw_path.write_text("id,loan_status\n1,Fully Paid\n2,Charged Off\n", encoding="utf-8")
 
     features_payload = {
         "challenger": {
@@ -233,7 +265,7 @@ def _write_test_environment(
 
     config_payload = {
         "random_seed": 17,
-        "raw_csv": str(root / "data/raw/unused.csv"),
+        "raw_csv": str(raw_path),
         "processed_dir": str(processed_dir),
         "artifact_dir": str(artifact_dir),
         "figure_dir": str(root / "reports/figures"),
@@ -348,6 +380,22 @@ def _write_test_environment(
     }
     policy_path = artifact_dir / "policy.json"
     policy_path.write_text(json.dumps(policy_payload, indent=2), encoding="utf-8")
+    (artifact_dir / "validation_metrics.json").write_text(
+        '{"fixture":"validation"}\n',
+        encoding="utf-8",
+    )
+    (artifact_dir / "calibration_metrics.json").write_text(
+        '{"fixture":"calibration"}\n',
+        encoding="utf-8",
+    )
+    (artifact_dir / "calibration_curve.csv").write_text(
+        "method,bin,sample_count\nsigmoid,0,2\n",
+        encoding="utf-8",
+    )
+    (artifact_dir / "cost_sensitivity.csv").write_text(
+        "lgd,margin,review_cost\n0.6,0.05,30.0\n",
+        encoding="utf-8",
+    )
 
     test_path = processed_dir / "test.parquet"
     test_frame.to_parquet(test_path, index=False)
@@ -362,10 +410,15 @@ def test_evaluate_uses_only_frozen_test_artifacts_and_writes_stable_schemas(
         _write_test_environment(tmp_path, forbid_fit=True)
     )
     input_paths = [
+        tmp_path / "data/raw/raw_snapshot.csv",
         artifact_dir / "preprocessor.joblib",
         artifact_dir / "calibrated_model.joblib",
         artifact_dir / "uncalibrated_model.joblib",
         artifact_dir / "policy.json",
+        artifact_dir / "validation_metrics.json",
+        artifact_dir / "calibration_metrics.json",
+        artifact_dir / "calibration_curve.csv",
+        artifact_dir / "cost_sensitivity.csv",
         test_path,
     ]
     original_bytes = {path: path.read_bytes() for path in input_paths}
@@ -433,6 +486,19 @@ def test_evaluate_uses_only_frozen_test_artifacts_and_writes_stable_schemas(
     assert ece_calls == [10, 10, 10]
     assert all(path.read_bytes() == original_bytes[path] for path in input_paths)
     assert OUTPUT_NAMES.issubset(path.name for path in artifact_dir.iterdir())
+    release_dir = artifact_dir / "release"
+    manifest = validate_release_bundle(release_dir)
+    assert manifest.version == "0.1.0"
+    assert manifest.feature_set == "challenger"
+    assert manifest.data_hash == sha256_file(tmp_path / "data/raw/raw_snapshot.csv")
+    assert {item.path for item in manifest.files} == RELEASE_SOURCE_NAMES
+    assert {path.name for path in release_dir.iterdir()} == {
+        *RELEASE_SOURCE_NAMES,
+        "release_manifest.json",
+    }
+    assert PROHIBITED_RELEASE_NAMES.isdisjoint(path.name for path in release_dir.iterdir())
+    for name in RELEASE_SOURCE_NAMES:
+        assert (release_dir / name).read_bytes() == (artifact_dir / name).read_bytes()
     figure_dir = tmp_path / "reports/figures"
     assert {path.name for path in figure_dir.iterdir()} == SHAP_FIGURE_NAMES
 
@@ -611,6 +677,7 @@ def test_evaluate_rerun_is_deterministic(tmp_path: Path) -> None:
         if not name.endswith(".parquet")
     }
     first_scored = pd.read_parquet(artifact_dir / "scored_test.parquet")
+    first_release = {path.name: path.read_bytes() for path in (artifact_dir / "release").iterdir()}
 
     evaluate_script.main(config_path=config_path, feature_dictionary_path=features_path)
 
@@ -620,8 +687,10 @@ def test_evaluate_rerun_is_deterministic(tmp_path: Path) -> None:
         if not name.endswith(".parquet")
     }
     second_scored = pd.read_parquet(artifact_dir / "scored_test.parquet")
+    second_release = {path.name: path.read_bytes() for path in (artifact_dir / "release").iterdir()}
     assert second_text_outputs == first_text_outputs
     pd.testing.assert_frame_equal(second_scored, first_scored)
+    assert second_release == first_release
 
 
 def test_evaluate_cli_executes_from_another_working_directory(tmp_path: Path) -> None:
@@ -652,6 +721,28 @@ def test_evaluate_cli_executes_from_another_working_directory(tmp_path: Path) ->
 
     assert result.returncode == 0, result.stderr
     assert OUTPUT_NAMES.issubset(path.name for path in artifact_dir.iterdir())
+    assert validate_release_bundle(artifact_dir / "release").files
+
+
+def test_evaluate_requires_raw_snapshot_before_reading_test_partition(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path, features_path, _, _, _, _ = _write_test_environment(
+        tmp_path,
+        forbid_fit=False,
+    )
+    raw_path = tmp_path / "data/raw/raw_snapshot.csv"
+    raw_path.unlink()
+    evaluate_script = _load_evaluate_script("evaluate_missing_raw")
+
+    def forbidden_read(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("test partition must not be read before raw snapshot validation")
+
+    monkeypatch.setattr(pd, "read_parquet", forbidden_read)
+
+    with pytest.raises(FileNotFoundError, match="raw data snapshot"):
+        evaluate_script.main(config_path=config_path, feature_dictionary_path=features_path)
 
 
 @pytest.mark.parametrize(
