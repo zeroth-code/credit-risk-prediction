@@ -23,6 +23,13 @@ BASE_CONFIG_PATH = PROJECT_ROOT / "configs/base.yaml"
 FEATURE_DICTIONARY_PATH = PROJECT_ROOT / "configs/features.yaml"
 CLASSIFICATION_THRESHOLD = 0.5
 BOOTSTRAP_SAMPLES = 1000
+BOOTSTRAP_CONFIDENCE_LEVEL = 0.95
+BOOTSTRAP_INTERVAL_METHOD = "percentile"
+BOOTSTRAP_RESAMPLING = "stratified_with_replacement"
+ECE_BINS = 10
+ECE_BINNING = "equal_width"
+ECE_FINAL_BIN_INCLUSIVE = True
+TEST_SCORING_PROBABILITY_SOURCE = "frozen_calibrated_model"
 POLICY_FIELDS = (
     "approve_below",
     "decline_at",
@@ -118,6 +125,23 @@ def _policy_provenance(payload: dict[str, object]) -> dict[str, str]:
             allowed = ", ".join(sorted(allowed_values))
             raise ValueError(f"policy field {field} must be one of: {allowed}")
         provenance[field] = value
+    method = provenance["selected_calibration_method"]
+    probability_source = provenance["probability_source"]
+    calibration_protocol = provenance["calibration_evaluation_protocol"]
+    if method in {"sigmoid", "isotonic"} and (
+        probability_source != "stratified_oof" or calibration_protocol != "stratified_oof"
+    ):
+        raise ValueError(
+            "policy selected_calibration_method sigmoid/isotonic requires "
+            "probability_source=stratified_oof and "
+            "calibration_evaluation_protocol=stratified_oof"
+        )
+    if method == "uncalibrated" and probability_source != "base_model_calibration_partition":
+        raise ValueError(
+            "policy selected_calibration_method uncalibrated requires "
+            "probability_source=base_model_calibration_partition; "
+            "calibration_evaluation_protocol may be stratified_oof or base_model_holdout_only"
+        )
     return provenance
 
 
@@ -145,6 +169,7 @@ def _load_policy(path: Path) -> dict[str, object]:
     if currency != "USD":
         raise ValueError("policy field currency must be USD")
     provenance = _policy_provenance(payload)
+    threshold_selection_probability_source = provenance.pop("probability_source")
 
     return {
         "approve_below": approve_below,
@@ -153,6 +178,7 @@ def _load_policy(path: Path) -> dict[str, object]:
         "margin": margin,
         "review_cost": review_cost,
         "currency": currency,
+        "threshold_selection_probability_source": threshold_selection_probability_source,
         **provenance,
     }
 
@@ -195,31 +221,80 @@ def _validated_loan_amounts(frame: pd.DataFrame) -> np.ndarray:
 
 
 def _validated_months(frame: pd.DataFrame) -> np.ndarray:
-    try:
-        issue_dates = pd.to_datetime(frame["issue_d"], errors="raise")
-    except (TypeError, ValueError) as exc:
-        raise ValueError("test issue_d must contain valid dates") from exc
+    issue_d = frame["issue_d"]
+    if issue_d.empty:
+        raise ValueError("test issue_d must be non-empty")
+    if pd.api.types.is_datetime64_any_dtype(issue_d.dtype):
+        issue_dates = issue_d
+    else:
+        raw_values = issue_d.to_numpy(dtype=object, copy=True)
+        if not all(isinstance(value, str) for value in raw_values):
+            raise ValueError("test issue_d must use a datetime dtype or ISO-8601 date strings")
+        date_strings = issue_d.astype("string").str.strip()
+        if date_strings.isna().any() or date_strings.eq("").any():
+            raise ValueError("test issue_d date strings must be non-empty")
+        try:
+            issue_dates = pd.to_datetime(date_strings, format="ISO8601", errors="raise")
+        except (TypeError, ValueError) as exc:
+            raise ValueError("test issue_d strings must contain valid ISO-8601 dates") from exc
     if issue_dates.isna().any():
         raise ValueError("test issue_d must not contain missing dates")
+    if issue_dates.dt.tz is not None:
+        issue_dates = issue_dates.dt.tz_convert(None)
     return issue_dates.dt.to_period("M").astype(str).to_numpy()
 
 
+def _validated_model_classes(model: object) -> tuple[np.ndarray, int]:
+    if not hasattr(model, "classes_"):
+        raise ValueError("calibrated model artifact must provide classes_")
+    try:
+        classes = np.asarray(model.classes_)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "calibrated model classes_ must be a one-dimensional binary array"
+        ) from exc
+    if classes.ndim != 1 or len(classes) != 2:
+        raise ValueError("calibrated model classes_ must be one-dimensional with length 2")
+    contains_boolean = np.issubdtype(classes.dtype, np.bool_) or (
+        classes.dtype == object and any(isinstance(value, (bool, np.bool_)) for value in classes)
+    )
+    if contains_boolean:
+        raise ValueError("calibrated model classes_ must not contain boolean values")
+    try:
+        has_missing = bool(pd.isna(classes).any())
+        is_binary = bool(np.isin(classes, [0, 1]).all())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("calibrated model classes_ must contain exactly labels 0 and 1") from exc
+    if has_missing or not is_binary or len(np.unique(classes)) != 2:
+        raise ValueError("calibrated model classes_ must contain exactly unique labels 0 and 1")
+    positive_indices = np.flatnonzero(classes == 1)
+    if len(positive_indices) != 1:
+        raise ValueError("calibrated model classes_ must contain exactly one positive label 1")
+    return classes, int(positive_indices[0])
+
+
 def _validated_probabilities(model: object, matrix: object, expected_rows: int) -> np.ndarray:
+    classes, positive_class_index = _validated_model_classes(model)
     predict_proba = getattr(model, "predict_proba", None)
     if not callable(predict_proba):
         raise ValueError("calibrated model artifact must provide predict_proba")
-    probability_matrix = np.asarray(predict_proba(matrix))
-    if probability_matrix.ndim != 2 or probability_matrix.shape != (expected_rows, 2):
+    try:
+        probability_matrix = np.asarray(predict_proba(matrix)).astype(float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("calibrated model probability matrix must contain numeric values") from exc
+    expected_shape = (expected_rows, len(classes))
+    if probability_matrix.ndim != 2 or probability_matrix.shape != expected_shape:
         raise ValueError(
             "calibrated model predict_proba output must have shape "
-            f"({expected_rows}, 2), got {probability_matrix.shape}"
+            f"{expected_shape}, got {probability_matrix.shape}"
         )
-    probabilities = probability_matrix[:, 1].astype(float, copy=False)
-    if not np.isfinite(probabilities).all():
-        raise ValueError("calibrated model probabilities must be finite")
-    if not ((probabilities >= 0.0) & (probabilities <= 1.0)).all():
-        raise ValueError("calibrated model probabilities must be between 0 and 1")
-    return probabilities
+    if not np.isfinite(probability_matrix).all():
+        raise ValueError("calibrated model probability matrix must contain only finite values")
+    if not ((probability_matrix >= 0.0) & (probability_matrix <= 1.0)).all():
+        raise ValueError("calibrated model probability matrix values must be between 0 and 1")
+    if not np.allclose(probability_matrix.sum(axis=1), 1.0, rtol=1e-7, atol=1e-8):
+        raise ValueError("calibrated model probability matrix rows must sum to 1")
+    return probability_matrix[:, positive_class_index].copy()
 
 
 def _policy_summary(
@@ -293,7 +368,7 @@ def _temporal_metrics(
                 "brier_score": float(brier_score_loss(monthly_target, monthly_probabilities)),
                 "log_loss": float(log_loss(monthly_target, monthly_probabilities, labels=[0, 1])),
                 "expected_calibration_error": expected_calibration_error(
-                    monthly_target, monthly_probabilities
+                    monthly_target, monthly_probabilities, bins=ECE_BINS
                 ),
                 "approval_rate": monthly_policy["approval_rate"],
                 "review_rate": monthly_policy["review_rate"],
@@ -415,20 +490,39 @@ def main(
         "test_samples": int(len(target)),
         "prevalence": float(np.mean(target)),
         "predictive_metrics": predictive_metrics,
-        "expected_calibration_error": expected_calibration_error(target, probabilities),
+        "expected_calibration_error": expected_calibration_error(
+            target, probabilities, bins=ECE_BINS
+        ),
         "confidence_intervals": confidence_intervals,
         "classification_threshold": CLASSIFICATION_THRESHOLD,
+        "bootstrap_methodology": {
+            "samples": BOOTSTRAP_SAMPLES,
+            "confidence_level": BOOTSTRAP_CONFIDENCE_LEVEL,
+            "interval_method": BOOTSTRAP_INTERVAL_METHOD,
+            "resampling": BOOTSTRAP_RESAMPLING,
+            "random_seed": config.random_seed,
+        },
+        "ece_methodology": {
+            "bins": ECE_BINS,
+            "binning": ECE_BINNING,
+            "final_bin_inclusive": ECE_FINAL_BIN_INCLUSIVE,
+        },
         "model_provenance": {
             "feature_set": "challenger",
             "evaluation_partition": "test",
             "preprocessor_artifact": preprocessor_path.name,
             "model_artifact": model_path.name,
-            "probability_source": "frozen_calibrated_model",
+            "test_scoring_probability_source": TEST_SCORING_PROBABILITY_SOURCE,
         },
         "policy_provenance": {
             "policy_artifact": policy_path.name,
             "approve_below": policy["approve_below"],
             "decline_at": policy["decline_at"],
+            "selected_calibration_method": policy["selected_calibration_method"],
+            "threshold_selection_probability_source": policy[
+                "threshold_selection_probability_source"
+            ],
+            "calibration_evaluation_protocol": policy["calibration_evaluation_protocol"],
             "selection_partition": policy["selection_partition"],
             "threshold_selection_protocol": policy["threshold_selection_protocol"],
         },
@@ -445,6 +539,7 @@ def main(
     ]
     policy_results: dict[str, object] = {
         **policy,
+        "test_scoring_probability_source": TEST_SCORING_PROBABILITY_SOURCE,
         "test_samples": int(len(target)),
         "total_exposure": policy_summary["total_exposure"],
         "test_cost": policy_summary["policy_cost"],

@@ -13,6 +13,7 @@ import pytest
 import yaml
 from sklearn.linear_model import LogisticRegression
 
+from credit_risk.calibration import expected_calibration_error as real_expected_calibration_error
 from credit_risk.costs import assign_actions
 from credit_risk.features import make_tree_preprocessor
 from credit_risk.metrics import bootstrap_metric as real_bootstrap_metric
@@ -47,6 +48,8 @@ FINAL_METRICS_KEYS = {
     "expected_calibration_error",
     "confidence_intervals",
     "classification_threshold",
+    "bootstrap_methodology",
+    "ece_methodology",
     "model_provenance",
     "policy_provenance",
 }
@@ -57,7 +60,8 @@ POLICY_RESULT_KEYS = {
     "margin",
     "review_cost",
     "selected_calibration_method",
-    "probability_source",
+    "threshold_selection_probability_source",
+    "test_scoring_probability_source",
     "selection_partition",
     "threshold_selection_protocol",
     "calibration_evaluation_protocol",
@@ -69,6 +73,23 @@ POLICY_RESULT_KEYS = {
     "test_approval_rate",
     "test_review_rate",
     "test_decline_rate",
+}
+MODEL_PROVENANCE_KEYS = {
+    "feature_set",
+    "evaluation_partition",
+    "preprocessor_artifact",
+    "model_artifact",
+    "test_scoring_probability_source",
+}
+POLICY_PROVENANCE_KEYS = {
+    "policy_artifact",
+    "approve_below",
+    "decline_at",
+    "selected_calibration_method",
+    "threshold_selection_probability_source",
+    "calibration_evaluation_protocol",
+    "selection_partition",
+    "threshold_selection_protocol",
 }
 TEMPORAL_COLUMNS = [
     "month",
@@ -106,12 +127,29 @@ class FitForbiddenPreprocessor:
 class FitForbiddenModel:
     def __init__(self, fitted: object) -> None:
         self.fitted = fitted
+        self.classes_ = fitted.classes_  # type: ignore[attr-defined]
 
     def fit(self, *_args: object, **_kwargs: object) -> None:
         raise AssertionError("evaluation must not fit the calibrated model")
 
     def predict_proba(self, matrix: object) -> np.ndarray:
         return self.fitted.predict_proba(matrix)  # type: ignore[attr-defined,no-any-return]
+
+
+class PredictProbaStub:
+    def __init__(self, classes: object, probabilities: object) -> None:
+        self.classes_ = classes
+        self.probabilities = probabilities
+
+    def predict_proba(self, matrix: object) -> object:
+        del matrix
+        return self.probabilities
+
+
+class MissingClassesStub:
+    def predict_proba(self, matrix: object) -> np.ndarray:
+        del matrix
+        return np.array([[0.4, 0.6]])
 
 
 def _load_evaluate_script(module_name: str) -> ModuleType:
@@ -262,6 +300,7 @@ def test_evaluate_uses_only_frozen_test_artifacts_and_writes_stable_schemas(
         return original_read_parquet(path, *args, **kwargs)
 
     bootstrap_calls: list[tuple[str, int, int]] = []
+    ece_calls: list[int] = []
 
     def recording_bootstrap(
         y_true: object,
@@ -280,8 +319,18 @@ def test_evaluate_uses_only_frozen_test_artifacts_and_writes_stable_schemas(
             random_seed=random_seed,
         )
 
+    def recording_ece(
+        y_true: object,
+        probabilities: object,
+        *,
+        bins: int,
+    ) -> float:
+        ece_calls.append(bins)
+        return real_expected_calibration_error(y_true, probabilities, bins=bins)
+
     monkeypatch.setattr(pd, "read_parquet", guarded_read_parquet)
     monkeypatch.setattr(evaluate_script, "bootstrap_metric", recording_bootstrap)
+    monkeypatch.setattr(evaluate_script, "expected_calibration_error", recording_ece)
 
     evaluate_script.main(config_path=config_path, feature_dictionary_path=features_path)
 
@@ -291,6 +340,7 @@ def test_evaluate_uses_only_frozen_test_artifacts_and_writes_stable_schemas(
         ("average_precision", 1000, 17),
         ("brier_score", 1000, 17),
     ]
+    assert ece_calls == [10, 10, 10]
     assert all(path.read_bytes() == original_bytes[path] for path in input_paths)
     assert OUTPUT_NAMES.issubset(path.name for path in artifact_dir.iterdir())
 
@@ -304,6 +354,28 @@ def test_evaluate_uses_only_frozen_test_artifacts_and_writes_stable_schemas(
     }
     assert final_metrics["classification_threshold"] == 0.5
     assert final_metrics["test_samples"] == len(test_frame)
+    assert final_metrics["bootstrap_methodology"] == {
+        "samples": 1000,
+        "confidence_level": 0.95,
+        "interval_method": "percentile",
+        "resampling": "stratified_with_replacement",
+        "random_seed": 17,
+    }
+    assert final_metrics["ece_methodology"] == {
+        "bins": 10,
+        "binning": "equal_width",
+        "final_bin_inclusive": True,
+    }
+    assert set(final_metrics["model_provenance"]) == MODEL_PROVENANCE_KEYS
+    assert set(final_metrics["policy_provenance"]) == POLICY_PROVENANCE_KEYS
+    assert (
+        final_metrics["model_provenance"]["test_scoring_probability_source"]
+        == "frozen_calibrated_model"
+    )
+    assert (
+        final_metrics["policy_provenance"]["threshold_selection_probability_source"]
+        == policy["probability_source"]
+    )
 
     confusion = pd.read_csv(artifact_dir / "confusion_matrix.csv")
     assert confusion.columns.tolist() == ["actual_label", "predicted_label", "count"]
@@ -319,6 +391,9 @@ def test_evaluate_uses_only_frozen_test_artifacts_and_writes_stable_schemas(
     assert policy_results["approve_below"] == policy["approve_below"]
     assert policy_results["decline_at"] == policy["decline_at"]
     assert policy_results["currency"] == "USD"
+    assert policy_results["threshold_selection_probability_source"] == policy["probability_source"]
+    assert policy_results["test_scoring_probability_source"] == "frozen_calibrated_model"
+    assert "probability_source" not in policy_results
 
     temporal = pd.read_csv(artifact_dir / "temporal_metrics.csv")
     assert temporal.columns.tolist() == TEMPORAL_COLUMNS
@@ -445,3 +520,170 @@ def test_evaluate_rejects_policy_with_non_frozen_provenance(
 
     with pytest.raises(ValueError, match=message):
         evaluate_script._load_policy(policy_path)
+
+
+def test_validated_probabilities_uses_model_class_order_for_positive_class() -> None:
+    evaluate_script = _load_evaluate_script("evaluate_reversed_classes")
+    model = PredictProbaStub(
+        np.array([1, 0]),
+        np.array([[0.8, 0.2], [0.1, 0.9]]),
+    )
+
+    probabilities = evaluate_script._validated_probabilities(model, object(), 2)
+
+    np.testing.assert_array_equal(probabilities, np.array([0.8, 0.1]))
+
+
+def test_validated_probabilities_requires_model_classes() -> None:
+    evaluate_script = _load_evaluate_script("evaluate_missing_classes")
+
+    with pytest.raises(ValueError, match="classes_"):
+        evaluate_script._validated_probabilities(MissingClassesStub(), object(), 1)
+
+
+@pytest.mark.parametrize(
+    "classes",
+    [
+        np.array([[0, 1]]),
+        np.array([0]),
+        np.array([0, 1, 2]),
+        np.array([0, 0]),
+        np.array([False, True]),
+        np.array([0, pd.NA], dtype=object),
+        np.array(["0", "1"]),
+        np.array([0, 2]),
+    ],
+    ids=[
+        "not-one-dimensional",
+        "one-class",
+        "three-classes",
+        "duplicate",
+        "boolean",
+        "missing",
+        "strings",
+        "non-binary",
+    ],
+)
+def test_validated_probabilities_rejects_invalid_model_classes(classes: object) -> None:
+    evaluate_script = _load_evaluate_script("evaluate_invalid_classes")
+    model = PredictProbaStub(classes, np.array([[0.4, 0.6]]))
+
+    with pytest.raises(ValueError, match="classes_"):
+        evaluate_script._validated_probabilities(model, object(), 1)
+
+
+@pytest.mark.parametrize(
+    ("probability_matrix", "message"),
+    [
+        (np.array([[np.nan, 0.6]]), "finite"),
+        (np.array([[np.inf, 0.6]]), "finite"),
+        (np.array([[-0.1, 0.6]]), "between 0 and 1"),
+        (np.array([[1.1, 0.6]]), "between 0 and 1"),
+        (np.array([[0.3, 0.6]]), "sum to 1"),
+        (np.array([[pd.NA, 0.6]], dtype=object), "numeric"),
+    ],
+)
+def test_validated_probabilities_rejects_invalid_full_probability_matrix(
+    probability_matrix: np.ndarray,
+    message: str,
+) -> None:
+    evaluate_script = _load_evaluate_script("evaluate_invalid_probability_matrix")
+    model = PredictProbaStub(np.array([0, 1]), probability_matrix)
+
+    with pytest.raises(ValueError, match=message):
+        evaluate_script._validated_probabilities(model, object(), 1)
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {
+            "selected_calibration_method": "sigmoid",
+            "probability_source": "base_model_calibration_partition",
+            "calibration_evaluation_protocol": "stratified_oof",
+        },
+        {
+            "selected_calibration_method": "isotonic",
+            "probability_source": "stratified_oof",
+            "calibration_evaluation_protocol": "base_model_holdout_only",
+        },
+        {
+            "selected_calibration_method": "uncalibrated",
+            "probability_source": "stratified_oof",
+            "calibration_evaluation_protocol": "stratified_oof",
+        },
+    ],
+    ids=["sigmoid-source", "isotonic-protocol", "uncalibrated-source"],
+)
+def test_evaluate_rejects_contradictory_policy_provenance(
+    tmp_path: Path,
+    overrides: dict[str, str],
+) -> None:
+    _, _, artifact_dir, _, _, policy = _write_test_environment(tmp_path, forbid_fit=False)
+    policy.update(overrides)
+    policy_path = artifact_dir / "policy.json"
+    policy_path.write_text(json.dumps(policy), encoding="utf-8")
+    evaluate_script = _load_evaluate_script("evaluate_contradictory_policy")
+
+    with pytest.raises(
+        ValueError,
+        match=("selected_calibration_method.*probability_source.*calibration_evaluation_protocol"),
+    ):
+        evaluate_script._load_policy(policy_path)
+
+
+@pytest.mark.parametrize(
+    "issue_d",
+    [
+        pd.Series([202001, 202002]),
+        pd.Series([202001.0, 202002.0]),
+        pd.Series([True, False]),
+        pd.Series(["2020-01-01", 202002], dtype=object),
+        pd.Series(["2020-01-01", ""], dtype=object),
+        pd.Series(["2020-01-01", "   "], dtype=object),
+        pd.Series(["2020-01-01", None], dtype=object),
+        pd.Series(["2020-01-01", pd.NA], dtype=object),
+        pd.Series(["202001", "202002"], dtype=object),
+    ],
+    ids=[
+        "integer",
+        "float",
+        "boolean",
+        "mixed",
+        "empty-string",
+        "whitespace-string",
+        "none",
+        "pandas-na",
+        "non-iso-string",
+    ],
+)
+def test_validated_months_rejects_non_datetime_or_invalid_strings(issue_d: pd.Series) -> None:
+    evaluate_script = _load_evaluate_script("evaluate_invalid_issue_dates")
+
+    with pytest.raises(ValueError, match="issue_d"):
+        evaluate_script._validated_months(pd.DataFrame({"issue_d": issue_d}))
+
+
+@pytest.mark.parametrize(
+    ("issue_d", "expected"),
+    [
+        (
+            pd.Series(pd.to_datetime(["2020-02-29", "2020-01-01"])),
+            ["2020-02", "2020-01"],
+        ),
+        (
+            pd.Series(["2020-02-29", "2020-01-01"], dtype="string"),
+            ["2020-02", "2020-01"],
+        ),
+    ],
+    ids=["datetime-dtype", "iso-strings"],
+)
+def test_validated_months_accepts_supported_dates(
+    issue_d: pd.Series,
+    expected: list[str],
+) -> None:
+    evaluate_script = _load_evaluate_script("evaluate_valid_issue_dates")
+
+    months = evaluate_script._validated_months(pd.DataFrame({"issue_d": issue_d}))
+
+    assert months.tolist() == expected
