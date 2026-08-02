@@ -805,6 +805,22 @@ def test_load_release_artifacts_rejects_unavailable_observed_action(tmp_path: Pa
         demo.load_release_artifacts(release_dir)
 
 
+def test_load_release_artifacts_rejects_example_for_unobserved_action(
+    tmp_path: Path,
+) -> None:
+    release_dir = _create_release(
+        tmp_path,
+        policy_results_overrides={
+            "test_approval_rate": 0.55,
+            "test_review_rate": 0.45,
+            "test_decline_rate": 0.0,
+        },
+    )
+
+    with pytest.raises(demo.StartupError, match="decline.*test_decline_rate.*zero"):
+        demo.load_release_artifacts(release_dir)
+
+
 def test_load_release_artifacts_rejects_all_observed_actions_unavailable(
     tmp_path: Path,
 ) -> None:

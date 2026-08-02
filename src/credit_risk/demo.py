@@ -467,14 +467,18 @@ def _validate_shap_explanations(
     for action in sorted(required_actions):
         example = local_explanations[action]
         artifact = f"shap_explanations.local_explanations.{action}"
+        rate_field = action_rate_fields[action]
         if example is None:
-            rate_field = action_rate_fields[action]
             if action_rates[action] > 0.0:
                 raise ValueError(
                     f"{artifact} is unavailable but policy_test_results field "
                     f"{rate_field} is positive"
                 )
             continue
+        if action_rates[action] == 0.0:
+            raise ValueError(
+                f"{artifact} is present but policy_test_results field {rate_field} is zero"
+            )
         if not isinstance(example, dict):
             raise ValueError(f"{artifact} must be an object")
         missing_fields = sorted(required_local_fields - set(example))
