@@ -17,6 +17,7 @@ from credit_risk.calibration import expected_calibration_error  # noqa: E402
 from credit_risk.config import load_config  # noqa: E402
 from credit_risk.costs import assign_actions, policy_cost  # noqa: E402
 from credit_risk.explainability import generate_shap_explanations  # noqa: E402
+from credit_risk.fairness import build_fairness_diagnostics  # noqa: E402
 from credit_risk.features import build_feature_frame, load_feature_dictionary  # noqa: E402
 from credit_risk.metrics import binary_metrics, bootstrap_metric  # noqa: E402
 
@@ -70,6 +71,13 @@ TEMPORAL_COLUMNS = [
     "total_exposure",
     "currency",
 ]
+FAIRNESS_GROUPING_COLUMNS = ["annual_inc", "home_ownership", "addr_state", "emp_length"]
+FAIRNESS_OUTPUT_FILES = {
+    "income": "fairness_income.csv",
+    "home_ownership": "fairness_home_ownership.csv",
+    "region": "fairness_region.csv",
+    "employment": "fairness_employment.csv",
+}
 
 
 def _project_path(path: str | Path) -> Path:
@@ -424,7 +432,11 @@ def main(
     test_frame = pd.read_parquet(test_path)
     if test_frame.empty:
         raise ValueError("test partition must be non-empty")
-    required_columns = list(dict.fromkeys([*selected_columns, "bad", "issue_d", "loan_amnt"]))
+    required_columns = list(
+        dict.fromkeys(
+            [*selected_columns, "bad", "issue_d", "loan_amnt", *FAIRNESS_GROUPING_COLUMNS]
+        )
+    )
     missing_columns = [column for column in required_columns if column not in test_frame.columns]
     if missing_columns:
         raise ValueError(f"test partition missing required columns: {', '.join(missing_columns)}")
@@ -469,6 +481,14 @@ def main(
     )
     if not len(target) == len(probabilities) == len(predictions) == len(actions):
         raise RuntimeError("target, probability, prediction, and action rows are not aligned")
+
+    fairness_tables, fairness_summary = build_fairness_diagnostics(
+        test_frame,
+        target,
+        probabilities,
+        actions,
+        minimum_group_size=config.minimum_group_size,
+    )
 
     predictive_metrics = binary_metrics(
         target,
@@ -594,6 +614,13 @@ def main(
     ).to_csv(artifact_dir / "confusion_matrix.csv", index=False, encoding="utf-8")
     _write_json(artifact_dir / "policy_test_results.json", policy_results)
     temporal.to_csv(artifact_dir / "temporal_metrics.csv", index=False, encoding="utf-8")
+    for attribute, output_file in FAIRNESS_OUTPUT_FILES.items():
+        fairness_tables[attribute].to_csv(
+            artifact_dir / output_file,
+            index=False,
+            encoding="utf-8",
+        )
+    _write_json(artifact_dir / "fairness_summary.json", fairness_summary)
     scored.to_parquet(artifact_dir / "scored_test.parquet", index=False)
 
 

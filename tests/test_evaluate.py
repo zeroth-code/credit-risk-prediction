@@ -29,6 +29,11 @@ OUTPUT_NAMES = {
     "scored_test.parquet",
     "shap_importance.csv",
     "shap_explanations.json",
+    "fairness_income.csv",
+    "fairness_home_ownership.csv",
+    "fairness_region.csv",
+    "fairness_employment.csv",
+    "fairness_summary.json",
 }
 SHAP_FIGURE_NAMES = {
     "shap_beeswarm.png",
@@ -122,6 +127,17 @@ TEMPORAL_COLUMNS = [
     "policy_cost_per_1000_applications",
     "total_exposure",
     "currency",
+]
+FAIRNESS_COLUMNS = [
+    "group",
+    "count",
+    "bad_rate",
+    "selection_rate",
+    "true_positive_rate",
+    "false_positive_rate",
+    "roc_auc",
+    "brier_score",
+    "suppressed",
 ]
 
 
@@ -230,7 +246,7 @@ def _write_test_environment(
         "bad_statuses": ["Charged Off"],
         "unresolved_statuses": ["Current"],
         "calibration_methods": ["uncalibrated", "sigmoid", "isotonic"],
-        "minimum_group_size": 10,
+        "minimum_group_size": 2,
         "costs": {
             "base": {"lgd": 0.6, "margin": 0.05, "review_cost": 30.0},
             "lgd_values": [0.4, 0.6, 0.8],
@@ -299,6 +315,10 @@ def _write_test_environment(
                 "2018-02-28",
             ],
             "loan_amnt": [1000.0, 2000.0, 3000.0, 4000.0, 5000.0, 6000.0],
+            "annual_inc": [25_000.0, 35_000.0, 90_000.0, 45_000.0, 80_000.0, 70_000.0],
+            "home_ownership": [" RENT ", "RENT", "MORTGAGE", "MORTGAGE", None, "OWN"],
+            "addr_state": ["ny", " NY ", "ca", "CA", "tx", None],
+            "emp_length": ["1 year", " 1 year ", "10+ years", "10+ years", "", None],
         }
     )
     test_probabilities = fitted_model.predict_proba(
@@ -490,6 +510,41 @@ def test_evaluate_uses_only_frozen_test_artifacts_and_writes_stable_schemas(
     assert temporal.loc[0, ["roc_auc", "average_precision"]].isna().all()
     assert temporal.loc[0, ["brier_score", "log_loss", "policy_cost"]].notna().all()
 
+    fairness_files = {
+        "income": "fairness_income.csv",
+        "home_ownership": "fairness_home_ownership.csv",
+        "region": "fairness_region.csv",
+        "employment": "fairness_employment.csv",
+    }
+    for output_name in fairness_files.values():
+        fairness = pd.read_csv(artifact_dir / output_name)
+        assert fairness.columns.tolist() == FAIRNESS_COLUMNS
+        assert fairness["group"].tolist() == sorted(fairness["group"])
+        suppressed = fairness["suppressed"]
+        assert fairness.loc[suppressed, FAIRNESS_COLUMNS[2:-1]].isna().all().all()
+
+    fairness_summary = json.loads((artifact_dir / "fairness_summary.json").read_text())
+    assert fairness_summary["schema_version"] == "1.0"
+    assert fairness_summary["minimum_group_size"] == 2
+    assert fairness_summary["metric_semantics"]["favorable_ground_truth_outcome"] == (
+        "good/repaid (1 - bad)"
+    )
+    assert fairness_summary["metric_semantics"]["favorable_decision"] == "action == approve"
+    assert fairness_summary["metric_semantics"]["not_selected_actions"] == [
+        "manual_review",
+        "decline",
+    ]
+    assert "not a statutory fair-lending audit" in fairness_summary["limitations"]
+    assert set(fairness_summary["attributes"]) == set(fairness_files)
+    for name, output_name in fairness_files.items():
+        attribute = fairness_summary["attributes"][name]
+        assert attribute["output_file"] == output_name
+        assert attribute["total_group_count"] == (
+            attribute["evaluated_group_count"] + attribute["suppressed_group_count"]
+        )
+        for disparity in ("equal_opportunity_difference", "selection_rate_ratio"):
+            assert set(attribute[disparity]) == {"status", "value", "reason"}
+
     scored = original_read_parquet(artifact_dir / "scored_test.parquet")
     assert scored.columns.tolist() == [
         *test_frame.columns,
@@ -517,6 +572,22 @@ def test_evaluate_cli_help_resolves_from_another_working_directory(tmp_path: Pat
 
     assert result.returncode == 0
     assert "frozen" in result.stdout.lower()
+
+
+@pytest.mark.parametrize(
+    "column",
+    ["annual_inc", "home_ownership", "addr_state", "emp_length"],
+)
+def test_evaluate_requires_raw_fairness_grouping_columns(tmp_path: Path, column: str) -> None:
+    config_path, features_path, _, test_path, test_frame, _ = _write_test_environment(
+        tmp_path,
+        forbid_fit=False,
+    )
+    test_frame.drop(columns=[column]).to_parquet(test_path, index=False)
+    evaluate_script = _load_evaluate_script(f"evaluate_missing_fairness_{column}")
+
+    with pytest.raises(ValueError, match=f"missing required columns: {column}"):
+        evaluate_script.main(config_path=config_path, feature_dictionary_path=features_path)
 
 
 def test_evaluate_rerun_is_deterministic(tmp_path: Path) -> None:
