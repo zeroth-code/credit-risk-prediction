@@ -72,6 +72,5 @@ def test_requirements_match_the_locked_versions(requirements: dict[str, str]) ->
         if locked.get(name) != pinned
     }
     assert not drifted, (
-        "requirements.txt drifted from uv.lock; rerun scripts/export_requirements.sh: "
-        f"{drifted}"
+        f"requirements.txt drifted from uv.lock; rerun scripts/export_requirements.sh: {drifted}"
     )

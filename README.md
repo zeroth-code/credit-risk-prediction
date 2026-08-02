@@ -152,6 +152,26 @@ On the test set, this policy approves 9.3553%, sends 90.6447% to manual review, 
 16,272,165, or USD 57,493.53 per 1,000 applications. It is not a complete operating-cost
 estimate, especially with 90.6% of applications ending at the modeled review fee.
 
+### Why the policy declines nothing
+
+Three reasons, and only the first is mechanical:
+
+1. Calibrated test probabilities span 0.0044 to 0.4355, so no application reaches the 0.45
+   decline threshold.
+2. The grid search selected 0.45 because cost falls as the threshold rises and then goes flat.
+   Declining a good loan forfeits `loan_amnt * margin`, while review is a flat fee, so
+   declining is only cheaper when `(1 - PD) * loan_amnt * 0.05 < 30`. At the highest observed
+   PD that means a loan under about USD 1,063; the median test loan is USD 10,000. Thresholds
+   0.45 through 0.95 tie at the minimum cost, and the stable sort returns the smallest.
+3. The cost equation charges manual review a flat fee and stops, so review is a cheap sink
+   that absorbs unlimited risk. A cost model that carried the reviewer's eventual approve or
+   decline, and a review-capacity limit, would push work back toward automated decisions.
+
+Underlying all three, ROC AUC 0.663 is modest separation, and sigmoid calibration correctly
+keeps probabilities near the 14.9% base rate rather than manufacturing unearned confidence.
+The result is structural, not a knife-edge parameter choice: all 27 sensitivity scenarios
+select the same 0.05/0.45 thresholds with a 0% decline rate.
+
 The 27 calibration sensitivity scenarios span LGD 40%-80%, margin 3%-8%, and manual-review
 cost USD 15-60. The partial scenario-cost proxy ranges from USD 29,985.60 to USD 87,387.52 per
 1,000. No valid comparator policy is present in the release artifacts, so this project does

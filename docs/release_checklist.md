@@ -122,6 +122,11 @@ Local waterfall plots exist for `approve` and `manual_review` only. NOT MET: no 
 genuine declined example exists. The pipeline records the absent action rather than substituting
 a fabricated example. The application labels all SHAP output as association, not causation.
 
+The empty `decline` bucket is explained in the README section "Why the policy declines nothing":
+calibrated probabilities top out at 0.4355 against a 0.45 threshold, declining a typical loan
+costs more in forfeited margin than the flat review fee, and the cost equation charges review a
+terminal fee that makes it a cheap sink for risk.
+
 ## Four subgroup reports and the compliance limitation
 
 MET. `fairness_summary.json` plus four CSVs cover income quintiles (5 groups), home ownership
