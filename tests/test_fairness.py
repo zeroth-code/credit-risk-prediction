@@ -48,9 +48,50 @@ def test_income_band_handles_duplicate_edges_and_missing_values_deterministicall
         "Income Q1",
         "Income Q2",
         "Income Q2",
-        "Income Q3",
+        "Income Q4",
         "Unknown",
     ]
+    assert first.cat.categories.tolist() == [
+        "Income Q1",
+        "Income Q2",
+        "Income Q3",
+        "Income Q4",
+        "Unknown",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("values", "expected_labels", "expected_categories"),
+    [
+        (
+            [0.0, 0.0, 1.0, 1.0],
+            ["Income Q1", "Income Q1", "Income Q3", "Income Q3"],
+            ["Income Q1", "Income Q2", "Income Q3", "Unknown"],
+        ),
+        (
+            [10.0, 20.0],
+            ["Income Q1", "Income Q5"],
+            [
+                "Income Q1",
+                "Income Q2",
+                "Income Q3",
+                "Income Q4",
+                "Income Q5",
+                "Unknown",
+            ],
+        ),
+    ],
+    ids=["skipped-middle-code", "skipped-inner-codes"],
+)
+def test_income_band_preserves_retained_qcut_interval_numbers(
+    values: list[float],
+    expected_labels: list[str],
+    expected_categories: list[str],
+) -> None:
+    bands = income_band(pd.Series(values), quantiles=5)
+
+    assert bands.astype("string").tolist() == expected_labels
+    assert bands.cat.categories.tolist() == expected_categories
 
 
 def test_income_band_assigns_constant_nonmissing_values_to_one_band() -> None:
@@ -323,6 +364,19 @@ def test_build_fairness_diagnostics_is_deterministic_and_self_describing() -> No
         "region",
         "employment",
     }
+    for attribute in first_summary["attributes"].values():
+        assert "evaluated_group_count" not in attribute
+        assert attribute["total_group_count"] == (
+            attribute["unsuppressed_group_count"] + attribute["suppressed_group_count"]
+        )
+        for disparity in ("equal_opportunity_difference", "selection_rate_ratio"):
+            assert set(attribute[disparity]) == {
+                "status",
+                "value",
+                "reason",
+                "usable_group_count",
+                "undefined_group_count",
+            }
     assert first_summary["attributes"]["income"]["output_file"] == "fairness_income.csv"
     assert first_summary["attributes"]["home_ownership"]["group_definition"].startswith(
         "home_ownership"
@@ -398,11 +452,53 @@ def test_suppressed_groups_do_not_influence_summary_disparities() -> None:
         "status": "defined",
         "value": pytest.approx(0.5),
         "reason": None,
+        "usable_group_count": 2,
+        "undefined_group_count": 0,
     }
     assert home_summary["selection_rate_ratio"] == {
         "status": "defined",
         "value": pytest.approx(0.5),
         "reason": None,
+        "usable_group_count": 2,
+        "undefined_group_count": 0,
+    }
+
+
+def test_summary_reports_metric_specific_usable_and_undefined_group_counts() -> None:
+    frame = pd.DataFrame(
+        {
+            "annual_inc": [10_000.0, 20_000.0, 30_000.0, 40_000.0],
+            "home_ownership": ["all_bad", "all_bad", "mixed", "mixed"],
+            "addr_state": ["NY", "NY", "CA", "CA"],
+            "emp_length": ["all_bad", "all_bad", "mixed", "mixed"],
+        }
+    )
+
+    _, summary = build_fairness_diagnostics(
+        frame,
+        np.array([1, 1, 0, 1]),
+        np.array([0.8, 0.9, 0.2, 0.7]),
+        np.array(["decline", "manual_review", "approve", "decline"]),
+        minimum_group_size=2,
+    )
+
+    home = summary["attributes"]["home_ownership"]
+    assert home["total_group_count"] == 2
+    assert home["unsuppressed_group_count"] == 2
+    assert home["suppressed_group_count"] == 0
+    assert home["equal_opportunity_difference"] == {
+        "status": "undefined",
+        "value": None,
+        "reason": "fewer_than_two_usable_unsuppressed_groups",
+        "usable_group_count": 1,
+        "undefined_group_count": 1,
+    }
+    assert home["selection_rate_ratio"] == {
+        "status": "defined",
+        "value": pytest.approx(0.0),
+        "reason": None,
+        "usable_group_count": 2,
+        "undefined_group_count": 0,
     }
 
 
@@ -438,10 +534,14 @@ def test_summary_reports_too_few_usable_groups_and_zero_ratio_denominator() -> N
         "status": "undefined",
         "value": None,
         "reason": "fewer_than_two_usable_unsuppressed_groups",
+        "usable_group_count": 0,
+        "undefined_group_count": 0,
     }
     zero_home = zero_selection["attributes"]["home_ownership"]
     assert zero_home["selection_rate_ratio"] == {
         "status": "undefined",
         "value": None,
         "reason": "maximum_selection_rate_is_zero",
+        "usable_group_count": 2,
+        "undefined_group_count": 0,
     }

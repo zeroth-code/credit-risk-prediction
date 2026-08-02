@@ -136,22 +136,18 @@ def income_band(values: pd.Series, quantiles: int = 5) -> pd.Series:
             assigned[nonmissing_positions] = "Income Q1"
             band_count = 1
         else:
-            raw_codes = pd.qcut(
+            quantile_bins = pd.qcut(
                 nonmissing,
                 q=quantile_count,
-                labels=False,
                 duplicates="drop",
             )
-            observed_codes = sorted(int(code) for code in raw_codes.dropna().unique())
-            if not observed_codes:
+            raw_codes = quantile_bins.cat.codes.to_numpy()
+            band_count = len(quantile_bins.cat.categories)
+            if band_count == 0 or np.all(raw_codes < 0):
                 assigned[nonmissing_positions] = "Income Q1"
                 band_count = 1
             else:
-                compressed_codes = {
-                    code: f"Income Q{position + 1}" for position, code in enumerate(observed_codes)
-                }
-                assigned[nonmissing_positions] = raw_codes.map(compressed_codes).to_numpy()
-                band_count = len(observed_codes)
+                assigned[nonmissing_positions] = [f"Income Q{int(code) + 1}" for code in raw_codes]
 
     categories = [f"Income Q{position}" for position in range(1, band_count + 1)]
     categories.append("Unknown")
@@ -366,12 +362,18 @@ def _disparity(
     *,
     ratio: bool,
 ) -> dict[str, object]:
-    usable = table.loc[~table["suppressed"], metric].dropna()
+    unsuppressed = table.loc[~table["suppressed"], metric]
+    usable = unsuppressed.dropna()
+    eligibility = {
+        "usable_group_count": int(len(usable)),
+        "undefined_group_count": int(unsuppressed.isna().sum()),
+    }
     if len(usable) < 2:
         return {
             "status": "undefined",
             "value": None,
             "reason": "fewer_than_two_usable_unsuppressed_groups",
+            **eligibility,
         }
     maximum = float(usable.max())
     minimum = float(usable.min())
@@ -380,9 +382,15 @@ def _disparity(
             "status": "undefined",
             "value": None,
             "reason": "maximum_selection_rate_is_zero",
+            **eligibility,
         }
     value = minimum / maximum if ratio else maximum - minimum
-    return {"status": "defined", "value": float(value), "reason": None}
+    return {
+        "status": "defined",
+        "value": float(value),
+        "reason": None,
+        **eligibility,
+    }
 
 
 def _attribute_summary(name: str, table: pd.DataFrame) -> dict[str, object]:
@@ -390,7 +398,7 @@ def _attribute_summary(name: str, table: pd.DataFrame) -> dict[str, object]:
     return {
         **_ATTRIBUTE_METADATA[name],
         "total_group_count": int(len(table)),
-        "evaluated_group_count": int(len(table) - suppressed_count),
+        "unsuppressed_group_count": int(len(table) - suppressed_count),
         "suppressed_group_count": suppressed_count,
         "equal_opportunity_difference": _disparity(
             table,

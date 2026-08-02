@@ -540,10 +540,17 @@ def test_evaluate_uses_only_frozen_test_artifacts_and_writes_stable_schemas(
         attribute = fairness_summary["attributes"][name]
         assert attribute["output_file"] == output_name
         assert attribute["total_group_count"] == (
-            attribute["evaluated_group_count"] + attribute["suppressed_group_count"]
+            attribute["unsuppressed_group_count"] + attribute["suppressed_group_count"]
         )
+        assert "evaluated_group_count" not in attribute
         for disparity in ("equal_opportunity_difference", "selection_rate_ratio"):
-            assert set(attribute[disparity]) == {"status", "value", "reason"}
+            assert set(attribute[disparity]) == {
+                "status",
+                "value",
+                "reason",
+                "usable_group_count",
+                "undefined_group_count",
+            }
 
     scored = original_read_parquet(artifact_dir / "scored_test.parquet")
     assert scored.columns.tolist() == [
