@@ -429,6 +429,55 @@ def test_generate_shap_explanations_preserves_published_outputs_on_render_failur
     assert all(".staging" not in path.name for path in figure_dir.iterdir())
 
 
+def test_generate_shap_explanations_restores_outputs_on_late_payload_commit_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model, matrix, feature_names, scored = _explanation_inputs()
+    observed_mask = scored["action"] != "decline"
+    observed_scored = scored.loc[observed_mask].copy()
+    artifact_dir = tmp_path / "artifacts"
+    figure_dir = tmp_path / "figures"
+    final_paths = _known_output_paths(artifact_dir, figure_dir)
+    original_bytes = _seed_old_outputs(final_paths)
+    current_final = artifact_dir / "shap_importance.csv"
+    stale_final = figure_dir / "shap_waterfall_decline.png"
+    payload_final = artifact_dir / "shap_explanations.json"
+    original_replace = Path.replace
+    boundary_observed = False
+
+    def fail_payload_commit(path: Path, target: Path) -> Path:
+        nonlocal boundary_observed
+        if (
+            target == payload_final
+            and path.name.startswith(".shap_explanations")
+            and ".new.staging" in path.name
+        ):
+            boundary_observed = True
+            assert current_final.read_bytes() != original_bytes[current_final]
+            assert not stale_final.exists()
+            assert payload_final.read_bytes() == original_bytes[payload_final]
+            raise OSError("injected late payload commit failure")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", fail_payload_commit)
+
+    with pytest.raises(OSError, match="injected late payload commit failure"):
+        generate_shap_explanations(
+            model,
+            matrix[observed_mask.to_numpy()],
+            feature_names,
+            observed_scored,
+            artifact_dir=artifact_dir,
+            figure_dir=figure_dir,
+        )
+
+    assert boundary_observed
+    assert {path: path.read_bytes() for path in final_paths} == original_bytes
+    assert all(".staging" not in path.name for path in artifact_dir.iterdir())
+    assert all(".staging" not in path.name for path in figure_dir.iterdir())
+
+
 def test_generate_shap_explanations_retries_restore_and_recovers_all_outputs(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

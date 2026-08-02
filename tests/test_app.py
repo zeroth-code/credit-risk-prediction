@@ -786,6 +786,54 @@ def test_load_release_artifacts_accepts_unavailable_local_action(tmp_path: Path)
     assert artifacts.shap_explanations["local_explanations"]["decline"] is None
 
 
+def test_load_release_artifacts_rejects_string_policy_action_rate(tmp_path: Path) -> None:
+    release_dir = _create_release(
+        tmp_path,
+        policy_results_overrides={"test_approval_rate": "0.55"},
+    )
+
+    with pytest.raises(demo.StartupError, match="test_approval_rate.*JSON numeric"):
+        demo.load_release_artifacts(release_dir)
+
+
+@pytest.mark.parametrize(
+    ("approval_rate", "review_rate", "decline_rate"),
+    [
+        (0.2, 0.2, 0.0),
+        (0.6, 0.6, 0.2),
+    ],
+    ids=["below-one", "above-one"],
+)
+def test_load_release_artifacts_rejects_policy_action_rates_not_summing_to_one(
+    tmp_path: Path,
+    approval_rate: float,
+    review_rate: float,
+    decline_rate: float,
+) -> None:
+    payload = _production_shap_explanations_payload()
+    if decline_rate == 0.0:
+        local_explanations = payload["local_explanations"]
+        files = payload["files"]
+        assert isinstance(local_explanations, dict)
+        assert isinstance(files, dict)
+        waterfalls = files["waterfalls"]
+        assert isinstance(waterfalls, dict)
+        local_explanations["decline"] = None
+        del waterfalls["decline"]
+    release_dir = _create_release(
+        tmp_path,
+        policy_results_overrides={
+            "test_approval_rate": approval_rate,
+            "test_review_rate": review_rate,
+            "test_decline_rate": decline_rate,
+        },
+        shap_explanations_overrides=payload,
+    )
+
+    with pytest.raises(demo.StartupError, match="policy action rates.*sum to 1.0"):
+        demo.load_release_artifacts(release_dir)
+
+
 def test_load_release_artifacts_rejects_unavailable_observed_action(tmp_path: Path) -> None:
     payload = _production_shap_explanations_payload()
     local_explanations = payload["local_explanations"]

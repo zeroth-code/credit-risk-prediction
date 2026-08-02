@@ -444,16 +444,27 @@ def _validate_shap_explanations(
         "manual_review": "test_review_rate",
         "decline": "test_decline_rate",
     }
-    action_rates = {
-        action: _shap_number(
-            policy_test_results,
-            field,
-            artifact="policy_test_results",
-            minimum=0.0,
-            maximum=1.0,
+    action_rates: dict[str, float] = {}
+    for action, field in action_rate_fields.items():
+        value = policy_test_results.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(
+                f"policy_test_results field {field} must be an actual JSON numeric value"
+            )
+        rate = float(value)
+        if not math.isfinite(rate) or not 0.0 <= rate <= 1.0:
+            raise ValueError(f"policy_test_results field {field} is outside its allowed range")
+        action_rates[action] = rate
+    if not math.isclose(
+        sum(action_rates.values()),
+        1.0,
+        rel_tol=0.0,
+        abs_tol=1e-12,
+    ):
+        raise ValueError(
+            "policy_test_results policy action rates must sum to 1.0 "
+            "within absolute tolerance 1e-12"
         )
-        for action, field in action_rate_fields.items()
-    }
     required_local_fields = {
         "policy_action",
         "scored_index",
