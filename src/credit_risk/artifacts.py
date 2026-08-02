@@ -177,12 +177,52 @@ def _validate_data_hash(data_hash: str) -> str:
     return data_hash
 
 
-def _temporary_sibling(path: Path, token: str, role: str) -> Path:
-    return path.with_name(f".{path.name}.{token}.{role}")
+def _validated_release_paths(source_dir: str | Path, release_dir: str | Path) -> tuple[Path, Path]:
+    source_input = Path(source_dir)
+    release_input = Path(release_dir)
+    if any(part == ".." for path in (source_input, release_input) for part in path.parts):
+        raise ValueError("source_dir and release_dir must use canonical paths without '..'")
+    if source_input.is_symlink():
+        raise ValueError(f"release source must be a regular directory: {source_input}")
+    if release_input.is_symlink():
+        raise ValueError(f"release directory must be a direct child named release: {release_input}")
+    try:
+        source_path = source_input.resolve(strict=True)
+        release_parent = release_input.parent.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f"could not resolve release source and parent paths: {exc}") from exc
+    source_absolute = source_input.absolute()
+    release_parent_absolute = release_input.parent.absolute()
+    if source_absolute != source_path:
+        raise ValueError(
+            f"release source must use a canonical path without symlinks: {source_input}"
+        )
+    if release_parent_absolute != release_parent:
+        raise ValueError(
+            f"release directory must be a direct child named release without symlink aliases: "
+            f"{release_input}"
+        )
+    release_path = release_parent / release_input.name
+    if (
+        release_input.name != "release"
+        or release_parent_absolute != source_absolute
+        or release_parent != source_path
+        or release_path == source_path
+    ):
+        raise ValueError(
+            f"release directory must be a direct child named release of source_dir: "
+            f"{source_input / 'release'}"
+        )
+    return source_path, release_path
 
 
-def _recovery_backup_path(release_dir: Path, final_path: Path, token: str) -> Path:
-    return release_dir.parent / (f".{release_dir.name}.{final_path.name}.{token}.recovery.backup")
+def _transaction_sibling(
+    release_dir: Path,
+    final_path: Path,
+    token: str,
+    role: str,
+) -> Path:
+    return release_dir.parent / f".{release_dir.name}.{final_path.name}.{token}.{role}"
 
 
 def _retry_unlink(path: Path) -> OSError | None:
@@ -347,10 +387,9 @@ def create_release_bundle(
     feature_set: str,
     data_hash: str,
 ) -> ReleaseManifest:
-    source_path = Path(source_dir)
-    release_path = Path(release_dir)
     _validate_data_hash(data_hash)
-    if source_path.is_symlink() or not source_path.is_dir():
+    source_path, release_path = _validated_release_paths(source_dir, release_dir)
+    if not source_path.is_dir():
         raise ValueError(f"release source must be a regular directory: {source_path}")
     source_paths = {name: source_path / name for name in RELEASE_ARTIFACT_NAMES}
     for name, path in source_paths.items():
@@ -368,20 +407,30 @@ def create_release_bundle(
     final_paths = {name: release_path / name for name in RELEASE_ARTIFACT_NAMES}
     manifest_final = release_path / RELEASE_MANIFEST_FILENAME
     staged_paths = {
-        name: _temporary_sibling(final_paths[name], token, "new.staging")
+        name: _transaction_sibling(release_path, final_paths[name], token, "new.staging")
         for name in RELEASE_ARTIFACT_NAMES
     }
-    manifest_staged = _temporary_sibling(manifest_final, token, "new.staging")
+    manifest_staged = _transaction_sibling(
+        release_path,
+        manifest_final,
+        token,
+        "new.staging",
+    )
     known_finals = [*(final_paths[name] for name in RELEASE_ARTIFACT_NAMES), manifest_final]
     previous_paths = [*known_finals, *stale_final_paths]
     backup_paths = {
-        final_path: _recovery_backup_path(release_path, final_path, token)
+        final_path: _transaction_sibling(
+            release_path,
+            final_path,
+            token,
+            "recovery.backup",
+        )
         for final_path in previous_paths
     }
     temporary_paths = [*staged_paths.values(), manifest_staged, *backup_paths.values()]
     previous_outputs: dict[Path, Path | None] = {}
     publish_started = False
-    manifest_committed = False
+    publication_validated = False
 
     try:
         for name in RELEASE_ARTIFACT_NAMES:
@@ -428,18 +477,16 @@ def create_release_bundle(
             staged_paths[name].replace(final_paths[name])
         _remove_stale_release_files(stale_final_paths)
         manifest_staged.replace(manifest_final)
-        manifest_committed = True
-
-        _cleanup_temporary_files(list(backup_paths.values()))
-        _require_regular_nonempty_file(manifest_final, "published release manifest")
-        if load_manifest(manifest_final) != manifest:
+        validated_manifest = validate_release_bundle(release_path)
+        if validated_manifest != manifest:
             raise RuntimeError("published release manifest did not match staged manifest")
-        _validate_manifest_inventory(manifest, final_paths)
-        return validate_release_bundle(release_path)
+        publication_validated = True
+        _cleanup_temporary_files(list(backup_paths.values()))
+        return validated_manifest
     except Exception as publication_error:
         recovery_notes: list[str] = []
         preserved_backups: set[Path] = set()
-        if publish_started and not manifest_committed:
+        if publish_started and not publication_validated:
             recovery_notes, preserved_backups = _restore_previous_release(
                 previous_paths,
                 previous_outputs,

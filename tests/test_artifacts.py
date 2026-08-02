@@ -6,6 +6,7 @@ from typing import BinaryIO, Literal
 import pytest
 from pydantic import ValidationError
 
+import credit_risk.artifacts as artifacts_module
 from credit_risk.artifacts import (
     ReleaseFile,
     ReleaseManifest,
@@ -487,6 +488,68 @@ def test_create_release_bundle_rejects_invalid_data_hash_and_symlink_source(
         _create_bundle(source_dir, release_dir)
 
 
+def test_create_release_bundle_rejects_source_release_equality_without_mutation(
+    tmp_path: Path,
+) -> None:
+    source_dir = tmp_path / "artifacts"
+    _write_release_sources(source_dir)
+    excluded = source_dir / "uncalibrated_model.joblib"
+    excluded.write_bytes(b"excluded frozen model\n")
+    previous = {path.name: path.read_bytes() for path in source_dir.iterdir() if path.is_file()}
+
+    with pytest.raises(ValueError, match="direct child"):
+        _create_bundle(source_dir, source_dir)
+
+    assert {path.name: path.read_bytes() for path in source_dir.iterdir() if path.is_file()} == (
+        previous
+    )
+
+
+@pytest.mark.parametrize("alias_target", ["source", "release"])
+def test_create_release_bundle_rejects_dotdot_aliases_without_mutation(
+    tmp_path: Path,
+    alias_target: str,
+) -> None:
+    source_dir = tmp_path / "artifacts"
+    _write_release_sources(source_dir)
+    holder = source_dir / "holder"
+    holder.mkdir()
+    source_argument = holder / ".." if alias_target == "source" else source_dir
+    release_argument = (
+        source_dir / "release" if alias_target == "source" else holder / ".." / "release"
+    )
+    previous = {path.name: path.read_bytes() for path in source_dir.iterdir() if path.is_file()}
+
+    with pytest.raises(ValueError, match="canonical paths"):
+        _create_bundle(source_argument, release_argument)
+
+    assert {path.name: path.read_bytes() for path in source_dir.iterdir() if path.is_file()} == (
+        previous
+    )
+    assert not (source_dir / "release").exists()
+
+
+def test_create_release_bundle_rejects_symlink_parent_alias_without_mutation(
+    tmp_path: Path,
+) -> None:
+    source_dir = tmp_path / "artifacts"
+    _write_release_sources(source_dir)
+    alias = tmp_path / "artifacts-alias"
+    try:
+        alias.symlink_to(source_dir, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"directory symlinks are unavailable: {exc}")
+    previous = {path.name: path.read_bytes() for path in source_dir.iterdir() if path.is_file()}
+
+    with pytest.raises(ValueError, match="direct child"):
+        _create_bundle(source_dir, alias / "release")
+
+    assert {path.name: path.read_bytes() for path in source_dir.iterdir() if path.is_file()} == (
+        previous
+    )
+    assert not (source_dir / "release").exists()
+
+
 def test_create_release_bundle_preserves_previous_bundle_on_publish_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -520,6 +583,130 @@ def test_create_release_bundle_preserves_previous_bundle_on_publish_failure(
     assert {path.name: path.read_bytes() for path in release_dir.iterdir()} == previous
     assert not [path for path in release_dir.iterdir() if path.name.startswith(".")]
     assert original_source_paths
+
+
+def test_create_release_bundle_restores_previous_bundle_when_final_validation_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "artifacts"
+    release_dir = source_dir / "release"
+    _write_release_sources(source_dir, prefix="old")
+    previous_manifest = _create_bundle(source_dir, release_dir)
+    previous = {path.name: path.read_bytes() for path in release_dir.iterdir()}
+    for path in source_dir.iterdir():
+        if path.is_file():
+            path.write_bytes(f"new:{path.name}\n".encode())
+
+    real_validate = artifacts_module.validate_release_bundle
+
+    def corrupt_then_validate(path: str | Path) -> ReleaseManifest:
+        model_path = Path(path) / "calibrated_model.joblib"
+        corrupted = bytearray(model_path.read_bytes())
+        corrupted[0] ^= 0xFF
+        model_path.write_bytes(corrupted)
+        return real_validate(path)
+
+    monkeypatch.setattr(artifacts_module, "validate_release_bundle", corrupt_then_validate)
+
+    with pytest.raises(ValueError, match="SHA-256 mismatch"):
+        _create_bundle(source_dir, release_dir)
+
+    assert real_validate(release_dir) == previous_manifest
+    assert {path.name: path.read_bytes() for path in release_dir.iterdir()} == previous
+    assert not [path for path in source_dir.iterdir() if path.name.endswith("recovery.backup")]
+
+
+def test_create_release_bundle_preserves_backup_when_validation_rollback_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "artifacts"
+    release_dir = source_dir / "release"
+    _write_release_sources(source_dir, prefix="old")
+    _create_bundle(source_dir, release_dir)
+    previous_model = (release_dir / "calibrated_model.joblib").read_bytes()
+    for path in source_dir.iterdir():
+        if path.is_file():
+            path.write_bytes(f"new:{path.name}\n".encode())
+
+    real_validate = artifacts_module.validate_release_bundle
+
+    def corrupt_then_validate(path: str | Path) -> ReleaseManifest:
+        model_path = Path(path) / "calibrated_model.joblib"
+        corrupted = bytearray(model_path.read_bytes())
+        corrupted[0] ^= 0xFF
+        model_path.write_bytes(corrupted)
+        return real_validate(path)
+
+    original_replace = Path.replace
+
+    def fail_model_restore(self: Path, target: str | Path) -> Path:
+        if Path(target).name == "calibrated_model.joblib" and self.name.endswith("recovery.backup"):
+            raise OSError("persistent validation rollback failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(artifacts_module, "validate_release_bundle", corrupt_then_validate)
+    monkeypatch.setattr(Path, "replace", fail_model_restore)
+
+    with pytest.raises(ValueError, match="SHA-256 mismatch") as exc_info:
+        _create_bundle(source_dir, release_dir)
+
+    backups = [
+        path
+        for path in source_dir.iterdir()
+        if "calibrated_model.joblib" in path.name and path.name.endswith("recovery.backup")
+    ]
+    assert len(backups) == 1
+    assert backups[0].read_bytes() == previous_model
+    assert any("release recovery failed" in note for note in exc_info.value.__notes__)
+
+
+def test_create_release_bundle_keeps_unremovable_staging_outside_restored_release(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_dir = tmp_path / "artifacts"
+    release_dir = source_dir / "release"
+    _write_release_sources(source_dir, prefix="old")
+    previous_manifest = _create_bundle(source_dir, release_dir)
+    for path in source_dir.iterdir():
+        if path.is_file():
+            path.write_bytes(f"new:{path.name}\n".encode())
+
+    original_replace = Path.replace
+    publish_failed = False
+
+    def fail_mid_publish(self: Path, target: str | Path) -> Path:
+        nonlocal publish_failed
+        if Path(target).name == "fairness_region.csv" and not publish_failed:
+            publish_failed = True
+            raise OSError("injected publication failure")
+        return original_replace(self, target)
+
+    original_unlink = Path.unlink
+
+    def fail_staging_cleanup(self: Path, *args: object, **kwargs: object) -> None:
+        if "shap_explanations.json" in self.name and self.name.endswith("new.staging"):
+            raise OSError("persistent staging cleanup failure")
+        original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "replace", fail_mid_publish)
+    monkeypatch.setattr(Path, "unlink", fail_staging_cleanup)
+
+    with pytest.raises(OSError, match="injected publication failure") as exc_info:
+        _create_bundle(source_dir, release_dir)
+
+    assert validate_release_bundle(release_dir) == previous_manifest
+    assert not [path for path in release_dir.iterdir() if path.name.endswith("new.staging")]
+    staging = [
+        path
+        for path in source_dir.iterdir()
+        if "shap_explanations.json" in path.name and path.name.endswith("new.staging")
+    ]
+    assert len(staging) == 1
+    assert staging[0].read_bytes() == (source_dir / "shap_explanations.json").read_bytes()
+    assert any("cleanup failed" in note for note in exc_info.value.__notes__)
 
 
 def test_create_release_bundle_retries_backup_restore(
