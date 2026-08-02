@@ -67,6 +67,21 @@ def _explanation_inputs(
     return model, matrix, [f"feature_{index}" for index in range(feature_count)], scored
 
 
+def _known_output_paths(artifact_dir: Path, figure_dir: Path) -> list[Path]:
+    return [
+        artifact_dir / "shap_importance.csv",
+        *(figure_dir / filename for filename in sorted(FIGURE_FILENAMES)),
+        artifact_dir / "shap_explanations.json",
+    ]
+
+
+def _seed_old_outputs(paths: list[Path]) -> dict[Path, bytes]:
+    for path in paths:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(f"old:{path.name}".encode())
+    return {path: path.read_bytes() for path in paths}
+
+
 def test_select_example_indices_returns_each_policy_action() -> None:
     scored = pd.DataFrame(
         {
@@ -351,16 +366,8 @@ def test_generate_shap_explanations_preserves_published_outputs_on_render_failur
     model, matrix, feature_names, scored = _explanation_inputs()
     artifact_dir = tmp_path / "artifacts"
     figure_dir = tmp_path / "figures"
-    artifact_dir.mkdir()
-    figure_dir.mkdir()
-    final_paths = [
-        artifact_dir / "shap_importance.csv",
-        artifact_dir / "shap_explanations.json",
-        *(figure_dir / filename for filename in sorted(FIGURE_FILENAMES)),
-    ]
-    for path in final_paths:
-        path.write_bytes(f"old:{path.name}".encode())
-    original_bytes = {path: path.read_bytes() for path in final_paths}
+    final_paths = _known_output_paths(artifact_dir, figure_dir)
+    original_bytes = _seed_old_outputs(final_paths)
     original_save_figure = explainability._save_figure
     render_calls = 0
 
@@ -392,6 +399,137 @@ def test_generate_shap_explanations_preserves_published_outputs_on_render_failur
     assert {path: path.read_bytes() for path in final_paths} == original_bytes
     assert all(".staging" not in path.name for path in artifact_dir.iterdir())
     assert all(".staging" not in path.name for path in figure_dir.iterdir())
+
+
+def test_generate_shap_explanations_retries_restore_and_recovers_all_outputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model, matrix, feature_names, scored = _explanation_inputs()
+    artifact_dir = tmp_path / "artifacts"
+    figure_dir = tmp_path / "figures"
+    final_paths = _known_output_paths(artifact_dir, figure_dir)
+    original_bytes = _seed_old_outputs(final_paths)
+    original_replace = Path.replace
+    restore_attempts = 0
+
+    def injected_replace(path: Path, target: Path) -> Path:
+        nonlocal restore_attempts
+        if path.name.startswith(".shap_dependence_01") and ".new.staging" in path.name:
+            raise OSError("injected publication failure")
+        if path.name.startswith(".shap_importance") and ".backup.staging" in path.name:
+            restore_attempts += 1
+            if restore_attempts == 1:
+                raise OSError("transient restore failure")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", injected_replace)
+
+    with pytest.raises(OSError, match="injected publication failure"):
+        generate_shap_explanations(
+            model,
+            matrix,
+            feature_names,
+            scored,
+            artifact_dir=artifact_dir,
+            figure_dir=figure_dir,
+        )
+
+    assert restore_attempts == 2
+    assert {path: path.read_bytes() for path in final_paths} == original_bytes
+    assert all(".staging" not in path.name for path in artifact_dir.iterdir())
+    assert all(".staging" not in path.name for path in figure_dir.iterdir())
+
+
+def test_generate_shap_explanations_preserves_unresolved_restore_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model, matrix, feature_names, scored = _explanation_inputs()
+    artifact_dir = tmp_path / "artifacts"
+    figure_dir = tmp_path / "figures"
+    final_paths = _known_output_paths(artifact_dir, figure_dir)
+    original_bytes = _seed_old_outputs(final_paths)
+    importance_path = artifact_dir / "shap_importance.csv"
+    original_replace = Path.replace
+
+    def injected_replace(path: Path, target: Path) -> Path:
+        if path.name.startswith(".shap_dependence_01") and ".new.staging" in path.name:
+            raise OSError("injected publication failure")
+        if path.name.startswith(".shap_importance") and ".backup.staging" in path.name:
+            raise OSError("persistent restore failure")
+        return original_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", injected_replace)
+
+    with pytest.raises(OSError, match="injected publication failure") as exc_info:
+        generate_shap_explanations(
+            model,
+            matrix,
+            feature_names,
+            scored,
+            artifact_dir=artifact_dir,
+            figure_dir=figure_dir,
+        )
+
+    for path in final_paths:
+        if path != importance_path:
+            assert path.read_bytes() == original_bytes[path]
+    remaining_temporary_paths = [
+        path
+        for directory in (artifact_dir, figure_dir)
+        for path in directory.iterdir()
+        if ".staging" in path.name
+    ]
+    assert len(remaining_temporary_paths) == 1
+    unresolved_backup = remaining_temporary_paths[0]
+    assert unresolved_backup.name.startswith(".shap_importance")
+    assert ".backup.staging" in unresolved_backup.name
+    assert unresolved_backup.read_bytes() == original_bytes[importance_path]
+    notes = "\n".join(getattr(exc_info.value, "__notes__", []))
+    assert str(importance_path) in notes
+    assert str(unresolved_backup) in notes
+
+
+def test_generate_shap_explanations_retries_cleanup_after_payload_commit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model, matrix, feature_names, scored = _explanation_inputs()
+    artifact_dir = tmp_path / "artifacts"
+    figure_dir = tmp_path / "figures"
+    final_paths = _known_output_paths(artifact_dir, figure_dir)
+    old_bytes = _seed_old_outputs(final_paths)
+    original_unlink = Path.unlink
+    cleanup_attempts = 0
+
+    def injected_unlink(path: Path, missing_ok: bool = False) -> None:
+        nonlocal cleanup_attempts
+        if path.name.startswith(".shap_importance") and ".backup.staging" in path.name:
+            cleanup_attempts += 1
+            if cleanup_attempts == 1:
+                raise OSError("transient cleanup failure")
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", injected_unlink)
+
+    payload = generate_shap_explanations(
+        model,
+        matrix,
+        feature_names,
+        scored,
+        artifact_dir=artifact_dir,
+        figure_dir=figure_dir,
+    )
+
+    assert cleanup_attempts == 2
+    assert json.loads((artifact_dir / "shap_explanations.json").read_text()) == payload
+    assert all(path.read_bytes() != old_bytes[path] for path in final_paths)
+    assert all(".staging" not in path.name for path in artifact_dir.iterdir())
+    assert all(".staging" not in path.name for path in figure_dir.iterdir())
+    continuation_path = tmp_path / "continued.txt"
+    continuation_path.write_text("continued", encoding="utf-8")
+    assert continuation_path.read_text(encoding="utf-8") == "continued"
 
 
 def test_generate_shap_explanations_removes_obsolete_dependence_plots(

@@ -1,6 +1,6 @@
 import json
 import warnings
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from shutil import copyfile
@@ -22,6 +22,7 @@ SHAP_PAYLOAD_FILENAME = "shap_explanations.json"
 SHAP_BEESWARM_FILENAME = "shap_beeswarm.png"
 SHAP_DEPENDENCE_FILENAMES = tuple(f"shap_dependence_{rank:02d}.png" for rank in range(1, 6))
 SHAP_WATERFALL_FILENAMES = {action: f"shap_waterfall_{action}.png" for action in POLICY_ACTIONS}
+FILESYSTEM_OPERATION_ATTEMPTS = 2
 
 
 def _sample_row_positions(
@@ -234,23 +235,124 @@ def _validate_staged_files(paths: list[Path]) -> None:
         )
 
 
-def _cleanup_temporary_files(paths: list[Path]) -> None:
+def _retry_filesystem_operation(operation: Callable[[], None]) -> OSError | None:
+    last_error: OSError | None = None
+    for _ in range(FILESYSTEM_OPERATION_ATTEMPTS):
+        try:
+            operation()
+            return None
+        except OSError as exc:
+            last_error = exc
+    return last_error
+
+
+def _cleanup_temporary_files(
+    paths: list[Path],
+    *,
+    preserve: set[Path] | None = None,
+) -> list[str]:
+    preserved_paths = preserve or set()
+    failures: list[str] = []
     for path in paths:
-        if path.is_file():
-            path.unlink()
+        if path in preserved_paths:
+            continue
+
+        def unlink_if_present(path: Path = path) -> None:
+            if path.is_file():
+                path.unlink()
+
+        error = _retry_filesystem_operation(unlink_if_present)
+        if error is not None:
+            failures.append(f"cleanup failed for temporary path {path}: {error}")
+    return failures
 
 
 def _restore_published_outputs(
     final_paths: list[Path],
     previous_outputs: dict[Path, Path | None],
-) -> None:
+) -> tuple[list[str], set[Path]]:
+    failures: list[str] = []
+    preserved_backups: set[Path] = set()
     for final_path in final_paths:
         backup_path = previous_outputs[final_path]
         if backup_path is None:
-            if final_path.is_file():
-                final_path.unlink()
-        elif backup_path.is_file():
+
+            def remove_new_final(final_path: Path = final_path) -> None:
+                if final_path.is_file():
+                    final_path.unlink()
+
+            error = _retry_filesystem_operation(remove_new_final)
+            if error is not None:
+                failures.append(f"recovery failed for final {final_path} without a backup: {error}")
+            continue
+
+        def restore_backup(
+            final_path: Path = final_path,
+            backup_path: Path = backup_path,
+        ) -> None:
             backup_path.replace(final_path)
+
+        error = _retry_filesystem_operation(restore_backup)
+        if error is not None:
+            preserved_backups.add(backup_path)
+            failures.append(
+                f"recovery failed for final {final_path} from backup {backup_path}: {error}"
+            )
+    return failures, preserved_backups
+
+
+def _add_exception_notes(exception: BaseException, notes: list[str]) -> None:
+    for note in notes:
+        exception.add_note(note)
+
+
+def _publish_staged_outputs(
+    *,
+    staged_by_final: dict[Path, Path],
+    backup_by_final: dict[Path, Path],
+    known_final_paths: list[Path],
+    current_non_payload_finals: list[Path],
+    obsolete_final_paths: list[Path],
+    payload_final: Path,
+) -> None:
+    temporary_paths = [*staged_by_final.values(), *backup_by_final.values()]
+    previous_outputs: dict[Path, Path | None] = {}
+    publish_started = False
+    publication_committed = False
+
+    try:
+        for final_path in known_final_paths:
+            if final_path.is_file():
+                backup_path = backup_by_final[final_path]
+                copyfile(final_path, backup_path)
+                previous_outputs[final_path] = backup_path
+            else:
+                previous_outputs[final_path] = None
+
+        publish_started = True
+        for final_path in current_non_payload_finals:
+            staged_by_final[final_path].replace(final_path)
+        for obsolete_path in obsolete_final_paths:
+            if obsolete_path.is_file():
+                obsolete_path.unlink()
+        staged_by_final[payload_final].replace(payload_final)
+        publication_committed = True
+    except Exception as publication_error:
+        recovery_notes: list[str] = []
+        preserved_backups: set[Path] = set()
+        if publish_started and not publication_committed:
+            recovery_notes, preserved_backups = _restore_published_outputs(
+                known_final_paths,
+                previous_outputs,
+            )
+        cleanup_notes = _cleanup_temporary_files(
+            temporary_paths,
+            preserve=preserved_backups,
+        )
+        _add_exception_notes(publication_error, [*recovery_notes, *cleanup_notes])
+        raise
+    else:
+        _cleanup_temporary_files(temporary_paths)
 
 
 def _save_figure(plt: object, path: Path, *, width: float, height: float) -> None:
@@ -409,9 +511,12 @@ def generate_shap_explanations(
         final_path: _temporary_sibling(final_path, token, "backup")
         for final_path in known_final_paths
     }
-    temporary_paths = [*staged_by_final.values(), *backup_by_final.values()]
-    previous_outputs: dict[Path, Path | None] = {}
-    publish_started = False
+    current_dependence_finals = set(dependence_finals)
+    obsolete_final_paths = [
+        figure_path / filename
+        for filename in SHAP_DEPENDENCE_FILENAMES
+        if figure_path / filename not in current_dependence_finals
+    ]
 
     try:
         importance.to_csv(
@@ -548,29 +653,19 @@ def generate_shap_explanations(
         }
         _write_payload(staged_by_final[payload_final], payload)
         _validate_staged_files(list(staged_by_final.values()))
-
-        for final_path in known_final_paths:
-            if final_path.is_file():
-                backup_path = backup_by_final[final_path]
-                copyfile(final_path, backup_path)
-                previous_outputs[final_path] = backup_path
-            else:
-                previous_outputs[final_path] = None
-
-        publish_started = True
-        for final_path in current_non_payload_finals:
-            staged_by_final[final_path].replace(final_path)
-        current_dependence_finals = set(dependence_finals)
-        for filename in SHAP_DEPENDENCE_FILENAMES:
-            dependence_final = figure_path / filename
-            if dependence_final not in current_dependence_finals and dependence_final.is_file():
-                dependence_final.unlink()
-        staged_by_final[payload_final].replace(payload_final)
-        return payload
-    except Exception:
-        if publish_started:
-            _restore_published_outputs(known_final_paths, previous_outputs)
+    except Exception as render_error:
+        cleanup_notes = _cleanup_temporary_files(list(staged_by_final.values()))
+        _add_exception_notes(render_error, cleanup_notes)
         raise
     finally:
-        _cleanup_temporary_files(temporary_paths)
         plt.close("all")
+
+    _publish_staged_outputs(
+        staged_by_final=staged_by_final,
+        backup_by_final=backup_by_final,
+        known_final_paths=known_final_paths,
+        current_non_payload_finals=current_non_payload_finals,
+        obsolete_final_paths=obsolete_final_paths,
+        payload_final=payload_final,
+    )
+    return payload
