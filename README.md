@@ -13,11 +13,12 @@ review while declining no applications.
 
 The public deployment URL will be added after deployment. No URL is invented here.
 
-> Screenshot pending: a current image must be captured from the genuine
-> `artifacts/release/` bundle. No old fixture or `test-1` screenshot is used.
+![Credit Risk Decision Lab scoring the pre-populated synthetic application](docs/assets/streamlit_demo.png)
 
-The local Streamlit application verifies the release manifest before loading artifacts and
-labels the experience as a demonstration rather than a lending decision tool.
+The screenshot was captured from the container image running the committed `artifacts/release/`
+bundle, showing the synthetic example scored at a 19.26% calibrated default probability and
+routed to manual review. The application verifies every manifest hash before loading artifacts
+and labels the experience as a demonstration rather than a lending decision tool.
 
 ## Business Problem
 
