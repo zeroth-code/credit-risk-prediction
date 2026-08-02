@@ -1,0 +1,499 @@
+import importlib.util
+import inspect
+import json
+import subprocess
+import sys
+from pathlib import Path
+from types import ModuleType
+
+import joblib
+import numpy as np
+import pandas as pd
+import pytest
+from pydantic import ValidationError
+from streamlit.testing.v1 import AppTest
+
+from credit_risk.artifacts import create_release_bundle
+from credit_risk.schemas import CreditPrediction
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+APP_PATH = PROJECT_ROOT / "app/streamlit_app.py"
+
+
+def _load_app_module() -> ModuleType:
+    module_name = "credit_risk_streamlit_app_test"
+    spec = importlib.util.spec_from_file_location(module_name, APP_PATH)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"could not load Streamlit app from {APP_PATH}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+streamlit_app = _load_app_module()
+
+
+class RecordingPreprocessor:
+    def __init__(self) -> None:
+        self.transform_calls: list[pd.DataFrame] = []
+
+    def fit(self, *_args: object, **_kwargs: object) -> None:
+        raise AssertionError("the application must never fit the frozen preprocessor")
+
+    def transform(self, frame: pd.DataFrame) -> np.ndarray:
+        self.transform_calls.append(frame.copy(deep=True))
+        return np.array([[1.0, 2.0]])
+
+
+class FixedProbabilityModel:
+    def __init__(
+        self,
+        *,
+        classes: tuple[int, int] = (0, 1),
+        probabilities: tuple[float, float] = (0.8, 0.2),
+    ) -> None:
+        self.classes_ = np.asarray(classes)
+        self.probabilities = np.asarray([probabilities], dtype=float)
+
+    def predict_proba(self, _matrix: object) -> np.ndarray:
+        return self.probabilities.copy()
+
+
+class MissingClassesModel:
+    def predict_proba(self, _matrix: object) -> np.ndarray:
+        return np.array([[0.8, 0.2]])
+
+
+def _write_json(path: Path, payload: object) -> None:
+    path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+
+def _create_release(
+    tmp_path: Path,
+    *,
+    model: object | None = None,
+    preprocessor: object | None = None,
+    policy_overrides: dict[str, object] | None = None,
+) -> Path:
+    source_dir = tmp_path / "artifacts"
+    source_dir.mkdir()
+    joblib.dump(model or FixedProbabilityModel(), source_dir / "calibrated_model.joblib")
+    joblib.dump(preprocessor or RecordingPreprocessor(), source_dir / "preprocessor.joblib")
+    policy = {
+        "approve_below": 0.25,
+        "decline_at": 0.65,
+        "lgd": 0.6,
+        "margin": 0.05,
+        "review_cost": 30.0,
+        "currency": "USD",
+        "selected_calibration_method": "sigmoid",
+        "probability_source": "stratified_oof",
+        "selection_partition": "calibration",
+        "threshold_selection_protocol": "grid_search_on_calibration_evaluation_probabilities",
+        "calibration_evaluation_protocol": "stratified_oof",
+    }
+    policy.update(policy_overrides or {})
+    _write_json(source_dir / "policy.json", policy)
+    _write_json(source_dir / "validation_metrics.json", {"primary_feature_set": "challenger"})
+    _write_json(
+        source_dir / "calibration_metrics.json",
+        {"selected_method": "sigmoid", "methods": {}},
+    )
+    _write_json(
+        source_dir / "final_test_metrics.json",
+        {
+            "test_samples": 120,
+            "predictive_metrics": {"roc_auc": 0.74, "brier_score": 0.08},
+            "expected_calibration_error": 0.03,
+            "confidence_intervals": {
+                "roc_auc": {"lower": 0.70, "upper": 0.78},
+                "brier_score": {"lower": 0.06, "upper": 0.10},
+            },
+        },
+    )
+    _write_json(
+        source_dir / "policy_test_results.json",
+        {
+            "approve_below": 0.25,
+            "decline_at": 0.65,
+            "test_cost_per_1000_applications": 1500.0,
+            "currency": "USD",
+            "test_approval_rate": 0.55,
+            "test_review_rate": 0.25,
+            "test_decline_rate": 0.20,
+        },
+    )
+    _write_json(
+        source_dir / "fairness_summary.json",
+        {
+            "schema_version": "1.0",
+            "minimum_group_size": 20,
+            "limitations": "This is not a statutory fair-lending audit.",
+            "attributes": {},
+        },
+    )
+    _write_json(
+        source_dir / "shap_explanations.json",
+        {
+            "schema_version": "1.0",
+            "explanation_model": {
+                "output_space": "raw_model_output",
+                "units": "log_odds",
+                "calibration_note": "Example explanations use the frozen base model.",
+            },
+            "local_explanations": {
+                action: {
+                    "policy_action": action,
+                    "calibrated_probability": probability,
+                    "top_contributions": [
+                        {
+                            "feature": "numeric__dti",
+                            "feature_value": 28.0,
+                            "shap_value": contribution,
+                        }
+                    ],
+                }
+                for action, probability, contribution in (
+                    ("approve", 0.12, -0.4),
+                    ("manual_review", 0.45, 0.2),
+                    ("decline", 0.78, 0.6),
+                )
+            },
+        },
+    )
+    (source_dir / "calibration_curve.csv").write_text(
+        "method,bin_index,mean_probability,observed_default_rate,sample_count\n"
+        "sigmoid,0,0.10,0.12,50\n",
+        encoding="utf-8",
+    )
+    (source_dir / "cost_sensitivity.csv").write_text(
+        "lgd,margin,review_cost,optimal_cost_per_1000_applications,is_base_scenario\n"
+        "0.6,0.05,30.0,1500.0,True\n",
+        encoding="utf-8",
+    )
+    (source_dir / "confusion_matrix.csv").write_text(
+        "actual_label,predicted_label,count\n0,0,70\n0,1,10\n1,0,20\n1,1,20\n",
+        encoding="utf-8",
+    )
+    (source_dir / "temporal_metrics.csv").write_text(
+        "month,count,roc_auc,brier_score,expected_calibration_error\n"
+        "2025-01,60,0.72,0.09,0.04\n2025-02,60,0.76,0.07,0.02\n",
+        encoding="utf-8",
+    )
+    fairness_csv = (
+        "group,count,bad_rate,selection_rate,true_positive_rate,false_positive_rate,"
+        "roc_auc,brier_score,suppressed\nA,60,0.2,0.6,0.7,0.1,0.75,0.08,False\n"
+    )
+    for name in (
+        "fairness_income.csv",
+        "fairness_home_ownership.csv",
+        "fairness_region.csv",
+        "fairness_employment.csv",
+    ):
+        (source_dir / name).write_text(fairness_csv, encoding="utf-8")
+    (source_dir / "shap_importance.csv").write_text(
+        "rank,feature,mean_abs_shap\n1,numeric__dti,0.4\n",
+        encoding="utf-8",
+    )
+    release_dir = source_dir / "release"
+    create_release_bundle(
+        source_dir,
+        release_dir,
+        version="test-1",
+        feature_set="challenger",
+        data_hash="b" * 64,
+    )
+    return release_dir
+
+
+def _application_payload() -> dict[str, object]:
+    return {
+        "loan_amnt": 25_000.0,
+        "annual_inc": 85_000.0,
+        "dti": 28.0,
+        "delinq_2yrs": 1.0,
+        "fico_range_low": 680.0,
+        "fico_range_high": 720.0,
+        "inq_last_6mths": 2.0,
+        "open_acc": 8.0,
+        "pub_rec": 0.0,
+        "revol_bal": 6_200.0,
+        "revol_util": 32.0,
+        "total_acc": 18.0,
+        "purpose": " debt_consolidation ",
+        "home_ownership": " MORTGAGE ",
+        "verification_status": " Verified ",
+        "emp_length": " 5+ years ",
+        "addr_state": " tx ",
+    }
+
+
+def test_streamlit_app_module_exists() -> None:
+    assert APP_PATH.is_file()
+
+
+def test_streamlit_script_imports_project_package_without_pytest_pythonpath() -> None:
+    code = f"""
+import importlib.util
+import sys
+from pathlib import Path
+
+project_root = Path({str(PROJECT_ROOT)!r})
+src_dir = (project_root / 'src').resolve()
+sys.path = [
+    entry for entry in sys.path
+    if not entry or Path(entry).resolve() != src_dir
+]
+spec = importlib.util.spec_from_file_location('clean_streamlit_import', {str(APP_PATH)!r})
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+print(module.PAGE_TITLE)
+"""
+
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=PROJECT_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "Credit Risk Decision Lab"
+
+
+def test_css_contract_clears_header_and_keeps_desktop_workflow_compact() -> None:
+    css_source = inspect.getsource(streamlit_app._inject_css)
+
+    assert '[data-testid="stHeader"] { display: none; }' in css_source
+    assert "padding: 1.25rem 1.35rem 3rem;" in css_source
+    assert '[data-testid="stForm"] [data-testid="stVerticalBlock"]' in css_source
+    assert "gap: 0.25rem;" in css_source
+    assert "height: 2.1rem !important;" in css_source
+    assert '[data-testid="stFormSubmitButton"] p { color: white; }' in css_source
+    assert "background: var(--cr-teal) !important;" in css_source
+    assert '[data-baseweb="tab-highlight"]' in css_source
+    assert '[data-testid="stDeployButton"]' in css_source
+
+
+def test_load_release_artifacts_validates_and_loads_typed_bundle(tmp_path: Path) -> None:
+    release_dir = _create_release(tmp_path)
+
+    artifacts = streamlit_app.load_release_artifacts(release_dir)
+
+    assert isinstance(artifacts, streamlit_app.ReleaseArtifacts)
+    assert artifacts.release_dir == release_dir
+    assert artifacts.manifest.feature_set == "challenger"
+    assert isinstance(artifacts.preprocessor, RecordingPreprocessor)
+    assert isinstance(artifacts.model, FixedProbabilityModel)
+    assert artifacts.policy.approve_below == pytest.approx(0.25)
+    assert artifacts.final_test_metrics["test_samples"] == 120
+    assert artifacts.fairness_tables["income"].loc[0, "group"] == "A"
+
+
+def test_load_release_artifacts_rejects_contradictory_policy_provenance(
+    tmp_path: Path,
+) -> None:
+    release_dir = _create_release(
+        tmp_path,
+        policy_overrides={"probability_source": "base_model_calibration_partition"},
+    )
+
+    with pytest.raises(streamlit_app.StartupError, match="policy"):
+        streamlit_app.load_release_artifacts(release_dir)
+
+
+@pytest.mark.parametrize("failure", ["missing", "tampered"])
+def test_load_release_artifacts_blocks_before_deserialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    release_dir = tmp_path / "missing-release"
+    if failure == "tampered":
+        release_dir = _create_release(tmp_path)
+        (release_dir / "policy.json").write_text("{}\n", encoding="utf-8")
+
+    def forbidden_joblib_load(_path: Path) -> object:
+        raise AssertionError("unsafe bundle reached joblib deserialization")
+
+    monkeypatch.setattr(streamlit_app.joblib, "load", forbidden_joblib_load)
+
+    with pytest.raises(streamlit_app.StartupError, match="release bundle"):
+        streamlit_app.load_release_artifacts(release_dir)
+
+
+def test_predict_application_uses_strict_schema_frozen_transform_and_bad_class(
+    tmp_path: Path,
+) -> None:
+    release_dir = _create_release(
+        tmp_path,
+        model=FixedProbabilityModel(classes=(1, 0), probabilities=(0.2, 0.8)),
+    )
+    artifacts = streamlit_app.load_release_artifacts(release_dir)
+    before = {path.name: path.read_bytes() for path in release_dir.iterdir()}
+
+    prediction = streamlit_app.predict_application(_application_payload(), artifacts)
+
+    assert isinstance(prediction, CreditPrediction)
+    assert type(prediction.default_probability) is float
+    assert prediction.default_probability == pytest.approx(0.2)
+    assert prediction.action == "approve"
+    assert prediction.explanation == [("numeric__dti", -0.4)]
+    assert len(artifacts.preprocessor.transform_calls) == 1
+    transformed_frame = artifacts.preprocessor.transform_calls[0]
+    assert transformed_frame.columns.tolist() == [
+        "loan_amnt",
+        "annual_inc",
+        "dti",
+        "delinq_2yrs",
+        "fico_range_low",
+        "fico_range_high",
+        "inq_last_6mths",
+        "open_acc",
+        "pub_rec",
+        "revol_bal",
+        "revol_util",
+        "total_acc",
+        "purpose",
+        "home_ownership",
+        "verification_status",
+        "emp_length",
+        "addr_state",
+    ]
+    assert transformed_frame.loc[0, "purpose"] == "debt_consolidation"
+    assert transformed_frame.loc[0, "addr_state"] == "TX"
+    assert {path.name: path.read_bytes() for path in release_dir.iterdir()} == before
+
+
+def test_predict_application_constructs_strict_credit_application(tmp_path: Path) -> None:
+    release_dir = _create_release(tmp_path)
+    artifacts = streamlit_app.load_release_artifacts(release_dir)
+    invalid_payload = _application_payload()
+    invalid_payload["loan_amnt"] = "25000"
+
+    with pytest.raises(ValidationError, match="loan_amnt"):
+        streamlit_app.predict_application(invalid_payload, artifacts)
+
+
+@pytest.mark.parametrize(
+    "model",
+    [
+        MissingClassesModel(),
+        FixedProbabilityModel(classes=(0, 2)),
+        FixedProbabilityModel(classes=(1, 1)),
+    ],
+    ids=["missing", "non-binary", "ambiguous"],
+)
+def test_predict_application_rejects_missing_nonbinary_or_ambiguous_bad_class(
+    tmp_path: Path,
+    model: object,
+) -> None:
+    release_dir = _create_release(tmp_path, model=model)
+    artifacts = streamlit_app.load_release_artifacts(release_dir)
+
+    with pytest.raises(streamlit_app.PredictionError, match="classes_"):
+        streamlit_app.predict_application(_application_payload(), artifacts)
+
+
+def test_predict_application_uses_frozen_policy_assignment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_dir = _create_release(
+        tmp_path,
+        model=FixedProbabilityModel(probabilities=(0.75, 0.25)),
+    )
+    artifacts = streamlit_app.load_release_artifacts(release_dir)
+    observed: dict[str, object] = {}
+
+    def recording_assign_actions(
+        probabilities: object,
+        *,
+        approve_below: float,
+        decline_at: float,
+    ) -> np.ndarray:
+        observed.update(
+            probabilities=np.asarray(probabilities).tolist(),
+            approve_below=approve_below,
+            decline_at=decline_at,
+        )
+        return np.array(["manual_review"])
+
+    monkeypatch.setattr(streamlit_app, "assign_actions", recording_assign_actions)
+
+    prediction = streamlit_app.predict_application(_application_payload(), artifacts)
+
+    assert prediction.action == "manual_review"
+    assert observed == {
+        "probabilities": [0.25],
+        "approve_below": 0.25,
+        "decline_at": 0.65,
+    }
+
+
+def test_explanation_view_labels_release_example_as_association(tmp_path: Path) -> None:
+    release_dir = _create_release(tmp_path)
+    artifacts = streamlit_app.load_release_artifacts(release_dir)
+    prediction = streamlit_app.predict_application(_application_payload(), artifacts)
+
+    explanation = streamlit_app.explanation_view(prediction, artifacts)
+
+    assert explanation.label == "Associations, not causal effects"
+    assert "example" in explanation.context.lower()
+    assert "not generated for the entered application" in explanation.context.lower()
+    assert explanation.table.to_dict("records") == [
+        {"Feature": "numeric__dti", "Association": -0.4}
+    ]
+
+
+def test_streamlit_startup_error_blocks_prediction_workflow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CREDIT_RISK_RELEASE_DIR", str(tmp_path / "missing-release"))
+
+    app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+
+    assert not app.exception
+    assert len(app.error) == 1
+    assert "release bundle" in app.error[0].value.lower()
+    assert not app.button
+
+
+def test_streamlit_workflow_renders_contract_and_assesses_synthetic_example(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_dir = _create_release(tmp_path)
+    monkeypatch.setenv("CREDIT_RISK_RELEASE_DIR", str(release_dir))
+
+    app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+
+    assert not app.exception
+    assert app.title[0].value == "Credit Risk Decision Lab"
+    assert [warning.value for warning in app.warning] == [
+        "Demonstration only - not a lending decision system. Inputs are not stored."
+    ]
+    assert [tab.label for tab in app.tabs] == [
+        "Model Performance",
+        "Calibration",
+        "Business Cost",
+        "Fairness",
+        "Limitations",
+    ]
+    assert app.button[0].label == "Run assessment"
+    assert len(app.number_input) == 12
+    assert len(app.selectbox) == 4
+    assert len(app.text_input) == 1
+    assert len(app.get("plotly_chart")) == 3
+
+    app = app.button[0].click().run(timeout=10)
+
+    assert not app.exception
+    rendered_text = "\n".join(element.value for element in app.markdown)
+    assert "20.00%" in rendered_text
+    assert "Approve" in rendered_text
+    assert "Associations, not causal effects" in rendered_text
