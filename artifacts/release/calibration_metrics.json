@@ -1,0 +1,38 @@
+{
+  "selected_method": "sigmoid",
+  "methods": {
+    "uncalibrated": {
+      "status": "evaluated",
+      "probability_source": "base_model_calibration_partition",
+      "brier_score": 0.23194766012548823,
+      "log_loss": 0.6522894154447628,
+      "expected_calibration_error": 0.32980008113286946
+    },
+    "sigmoid": {
+      "status": "evaluated",
+      "probability_source": "stratified_oof",
+      "brier_score": 0.11648213068204982,
+      "log_loss": 0.38662400775680017,
+      "expected_calibration_error": 0.0004477774421971077
+    },
+    "isotonic": {
+      "status": "evaluated",
+      "probability_source": "stratified_oof",
+      "brier_score": 0.11651428228382056,
+      "log_loss": 0.3871284014043048,
+      "expected_calibration_error": 0.0004045107873500853
+    }
+  },
+  "calibration_samples": 90615,
+  "calibration_prevalence": 0.141256966285935,
+  "ece_bins": 10,
+  "evaluation_protocol": "stratified_oof",
+  "evaluation_partition": "calibration",
+  "folds": 5,
+  "random_seed": 42,
+  "artifact": {
+    "method": "sigmoid",
+    "fit_protocol": "full_calibration_refit",
+    "fit_partition": "calibration"
+  }
+}

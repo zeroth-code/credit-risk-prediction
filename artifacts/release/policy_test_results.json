@@ -1,0 +1,21 @@
+{
+  "approve_below": 0.05,
+  "calibration_evaluation_protocol": "stratified_oof",
+  "currency": "USD",
+  "decline_at": 0.45,
+  "lgd": 0.6,
+  "margin": 0.05,
+  "review_cost": 30.0,
+  "selected_calibration_method": "sigmoid",
+  "selection_partition": "calibration",
+  "test_approval_rate": 0.09355324245829005,
+  "test_cost": 16272165.0,
+  "test_cost_per_1000_applications": 57493.5341629391,
+  "test_decline_rate": 0.0,
+  "test_review_rate": 0.90644675754171,
+  "test_samples": 283026,
+  "test_scoring_probability_source": "frozen_calibrated_model",
+  "threshold_selection_probability_source": "stratified_oof",
+  "threshold_selection_protocol": "grid_search_on_calibration_evaluation_probabilities",
+  "total_exposure": 3624300800.0
+}

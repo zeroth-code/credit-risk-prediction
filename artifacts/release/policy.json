@@ -1,0 +1,20 @@
+{
+  "approve_below": 0.05,
+  "decline_at": 0.45,
+  "lgd": 0.6,
+  "margin": 0.05,
+  "review_cost": 30.0,
+  "calibration_cost": 4696800.0,
+  "calibration_approval_rate": 0.086122606632456,
+  "calibration_review_rate": 0.913877393367544,
+  "calibration_decline_rate": 0.0,
+  "calibration_samples": 90615,
+  "total_loan_amount": 1131702375.0,
+  "currency": "USD",
+  "calibration_cost_per_1000_applications": 51832.47806654528,
+  "selected_calibration_method": "sigmoid",
+  "probability_source": "stratified_oof",
+  "selection_partition": "calibration",
+  "threshold_selection_protocol": "grid_search_on_calibration_evaluation_probabilities",
+  "calibration_evaluation_protocol": "stratified_oof"
+}

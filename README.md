@@ -256,19 +256,19 @@ Static checks use `uv run ruff check .`.
 ## Docker
 
 The image is built from the locked Python 3.12 runtime dependencies and does not install the
-development dependency group. Before building, the genuine frozen bundle must exist at
-`artifacts/release/`; Docker copies that bundle into the image and the application verifies it
-at startup.
+development dependency group. It also installs `libgomp1`, the OpenMP runtime that LightGBM
+links against and that the slim base image omits.
 
 ```bash
 docker build -t credit-risk-prediction:local .
 docker run --rm -p 8501:8501 credit-risk-prediction:local
 ```
 
-The release bundle remains a local, untracked build input in Task 17, so a clean clone needs a
-genuine `artifacts/release/` supplied before the image can be built. Task 18 will decide how the
-public release bundle is distributed. Do not load untrusted joblib files; Python pickle
-semantics can execute code during deserialization.
+The frozen bundle in `artifacts/release/` is committed, so a clean clone builds without first
+regenerating artifacts. Docker copies that bundle into the image, and the application verifies
+every manifest hash before it serves a prediction. Do not load untrusted joblib files; Python
+pickle semantics can execute code during deserialization, and manifest hashes verify integrity
+rather than authenticate a publisher.
 
 ## Limitations and Responsible Use
 

@@ -1,0 +1,67 @@
+{
+  "bootstrap_methodology": {
+    "confidence_level": 0.95,
+    "interval_method": "percentile",
+    "point_estimate_included": true,
+    "random_seed": 42,
+    "resampling": "stratified_with_replacement",
+    "samples": 1000
+  },
+  "classification_threshold": 0.5,
+  "confidence_intervals": {
+    "average_precision": {
+      "estimate": 0.24156811916805535,
+      "lower": 0.23879974556163086,
+      "upper": 0.24432558971796808
+    },
+    "brier_score": {
+      "estimate": 0.1215392935956546,
+      "lower": 0.12138010895458193,
+      "upper": 0.12170046066358611
+    },
+    "roc_auc": {
+      "estimate": 0.6627067682684525,
+      "lower": 0.6602597447823655,
+      "upper": 0.6653038089451841
+    }
+  },
+  "ece_methodology": {
+    "binning": "equal_width",
+    "bins": 10,
+    "final_bin_inclusive": true
+  },
+  "expected_calibration_error": 0.011107640169707127,
+  "model_provenance": {
+    "evaluation_partition": "test",
+    "feature_set": "challenger",
+    "model_artifact": "calibrated_model.joblib",
+    "preprocessor_artifact": "preprocessor.joblib",
+    "test_scoring_probability_source": "frozen_calibrated_model"
+  },
+  "policy_provenance": {
+    "approve_below": 0.05,
+    "calibration_evaluation_protocol": "stratified_oof",
+    "decline_at": 0.45,
+    "policy_artifact": "policy.json",
+    "selected_calibration_method": "sigmoid",
+    "selection_partition": "calibration",
+    "threshold_selection_probability_source": "stratified_oof",
+    "threshold_selection_protocol": "grid_search_on_calibration_evaluation_probabilities"
+  },
+  "predictive_metrics": {
+    "average_precision": 0.24156811916805535,
+    "brier_score": 0.1215392935956546,
+    "fn": 42132.0,
+    "fp": 0.0,
+    "ks": 0.23665400510602042,
+    "log_loss": 0.3996374347967477,
+    "precision": 0.0,
+    "recall": 0.0,
+    "roc_auc": 0.6627067682684525,
+    "specificity": 1.0,
+    "tn": 240894.0,
+    "tp": 0.0
+  },
+  "prevalence": 0.14886264866125373,
+  "test_samples": 283026
+}

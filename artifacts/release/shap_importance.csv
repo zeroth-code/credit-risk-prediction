@@ -1,0 +1,91 @@
+rank,feature,mean_abs_shap
+1,numeric__annual_inc,0.279390355624
+2,numeric__fico_range_low,0.251198661217
+3,numeric__inq_last_6mths,0.139354224255
+4,numeric__loan_amnt,0.128321870768
+5,numeric__dti,0.115706810109
+6,numeric__revol_util,0.0836011084301
+7,numeric__open_acc,0.0814195927416
+8,categorical__purpose_credit_card,0.0719485995643
+9,numeric__revol_bal,0.0682751450463
+10,numeric__fico_range_high,0.0598667885581
+11,numeric__total_acc,0.0562312683145
+12,categorical__home_ownership_RENT,0.0435208439158
+13,categorical__home_ownership_MORTGAGE,0.0354087160397
+14,categorical__emp_length_10+ years,0.0263223948987
+15,categorical__purpose_other,0.0242301348136
+16,numeric__pub_rec,0.020626493445
+17,categorical__purpose_small_business,0.0167466942299
+18,categorical__addr_state_TX,0.0158490742025
+19,categorical__verification_status_Source Verified,0.0140346370451
+20,categorical__addr_state_FL,0.0136310992022
+21,numeric__delinq_2yrs,0.0123900081939
+22,categorical__addr_state_NY,0.0111059171624
+23,categorical__addr_state_CO,0.0103080167766
+24,categorical__purpose_debt_consolidation,0.00904224800587
+25,categorical__addr_state_NJ,0.00899663937463
+26,categorical__addr_state_IL,0.00720302251631
+27,categorical__addr_state_GA,0.00664286978999
+28,categorical__addr_state_NV,0.00649802539836
+29,categorical__emp_length_1 year,0.00602573149308
+30,categorical__verification_status_Not Verified,0.0054749641575
+31,categorical__purpose_medical,0.00474994682912
+32,categorical__purpose_major_purchase,0.00434883977831
+33,categorical__verification_status_Verified,0.00400696145189
+34,categorical__addr_state_PA,0.00397241601679
+35,categorical__addr_state_CA,0.00386380103556
+36,categorical__emp_length_4 years,0.00311704895766
+37,categorical__addr_state_TN,0.00303808638253
+38,categorical__addr_state_NH,0.00296766972591
+39,categorical__emp_length_6 years,0.00284322326547
+40,categorical__addr_state_WA,0.00284313222278
+41,categorical__addr_state_SC,0.00269202649743
+42,categorical__addr_state_WV,0.00221502782987
+43,categorical__home_ownership_OWN,0.00194726035154
+44,categorical__purpose_moving,0.0019233748797
+45,categorical__purpose_home_improvement,0.00186088720748
+46,categorical__purpose_car,0.00173998278876
+47,categorical__addr_state_OR,0.00147344353192
+48,categorical__addr_state_DC,0.00145757987658
+49,categorical__purpose_vacation,0.00141843313752
+50,categorical__addr_state_MA,0.00140648923225
+51,categorical__emp_length_< 1 year,0.0013484784204
+52,categorical__emp_length_5 years,0.00123140357934
+53,categorical__emp_length_7 years,0.00106487421817
+54,categorical__addr_state_WI,0.000971559766227
+55,categorical__addr_state_MN,0.000965612446411
+56,categorical__addr_state_WY,0.000884570667358
+57,categorical__addr_state_KS,0.000795712170356
+58,categorical__addr_state_UT,0.000785455305658
+59,categorical__addr_state_MT,0.000757680833657
+60,categorical__emp_length_3 years,0.000746177795223
+61,categorical__addr_state_MO,0.000727566664673
+62,categorical__emp_length_2 years,0.000717887745563
+63,categorical__addr_state_OK,0.000667412896713
+64,categorical__addr_state_OH,0.000663456915007
+65,categorical__emp_length_8 years,0.0005771263399
+66,categorical__addr_state_KY,0.000570869106504
+67,categorical__addr_state_MI,0.000540800114985
+68,categorical__addr_state_VA,0.000499231517324
+69,categorical__addr_state_AL,0.00047943787026
+70,categorical__addr_state_AZ,0.000412372230728
+71,categorical__addr_state_RI,0.000328885759334
+72,categorical__addr_state_MD,0.000328560251584
+73,categorical__addr_state_NC,0.000316224332494
+74,categorical__emp_length_9 years,0.000307233651962
+75,categorical__addr_state_AR,0.000256127493983
+76,categorical__purpose_house,0.000204435321325
+77,categorical__addr_state_HI,0.000190783294592
+78,categorical__addr_state_IN,0.000190367807123
+79,categorical__purpose_wedding,0.000184619704992
+80,categorical__addr_state_DE,0.000126205159045
+81,categorical__purpose_renewable_energy,0.000121204135536
+82,categorical__addr_state_CT,8.35279846091e-05
+83,categorical__addr_state_SD,6.72719425523e-05
+84,categorical__addr_state_LA,6.03467118554e-05
+85,categorical__addr_state_NM,4.1579114168e-05
+86,categorical__addr_state_AK,3.65851727269e-05
+87,categorical__addr_state_VT,3.06445563766e-05
+88,categorical__addr_state_infrequent_sklearn,0
+89,categorical__home_ownership_NONE,0
+90,categorical__home_ownership_OTHER,0

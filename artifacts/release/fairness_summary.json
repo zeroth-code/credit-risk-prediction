@@ -1,0 +1,105 @@
+{
+  "attributes": {
+    "employment": {
+      "equal_opportunity_difference": {
+        "reason": null,
+        "status": "defined",
+        "undefined_group_count": 0,
+        "usable_group_count": 12,
+        "value": 0.051544410319770306
+      },
+      "group_definition": "emp_length stripped strings; missing or blank is Unknown",
+      "output_file": "fairness_employment.csv",
+      "selection_rate_ratio": {
+        "reason": null,
+        "status": "defined",
+        "undefined_group_count": 0,
+        "usable_group_count": 12,
+        "value": 0.5251368783281112
+      },
+      "suppressed_group_count": 0,
+      "total_group_count": 12,
+      "unsuppressed_group_count": 12
+    },
+    "home_ownership": {
+      "equal_opportunity_difference": {
+        "reason": null,
+        "status": "defined",
+        "undefined_group_count": 0,
+        "usable_group_count": 3,
+        "value": 0.10353673303697937
+      },
+      "group_definition": "home_ownership stripped strings; missing or blank is Unknown",
+      "output_file": "fairness_home_ownership.csv",
+      "selection_rate_ratio": {
+        "reason": null,
+        "status": "defined",
+        "undefined_group_count": 0,
+        "usable_group_count": 3,
+        "value": 0.3161121618214933
+      },
+      "suppressed_group_count": 1,
+      "total_group_count": 4,
+      "unsuppressed_group_count": 3
+    },
+    "income": {
+      "equal_opportunity_difference": {
+        "reason": null,
+        "status": "defined",
+        "undefined_group_count": 0,
+        "usable_group_count": 5,
+        "value": 0.2302775049097581
+      },
+      "group_definition": "five qcut annual_inc quantile bands computed on the frozen test partition with duplicate edges dropped; missing is Unknown",
+      "output_file": "fairness_income.csv",
+      "selection_rate_ratio": {
+        "reason": null,
+        "status": "defined",
+        "undefined_group_count": 0,
+        "usable_group_count": 5,
+        "value": 0.037062999243496576
+      },
+      "suppressed_group_count": 0,
+      "total_group_count": 5,
+      "unsuppressed_group_count": 5
+    },
+    "region": {
+      "equal_opportunity_difference": {
+        "reason": null,
+        "status": "defined",
+        "undefined_group_count": 0,
+        "usable_group_count": 4,
+        "value": 0.010746022450974474
+      },
+      "group_definition": "addr_state mapped to US Census regions after stripping and uppercasing; missing or unrecognized is Unknown",
+      "output_file": "fairness_region.csv",
+      "selection_rate_ratio": {
+        "reason": null,
+        "status": "defined",
+        "undefined_group_count": 0,
+        "usable_group_count": 4,
+        "value": 0.901024976339826
+      },
+      "suppressed_group_count": 0,
+      "total_group_count": 4,
+      "unsuppressed_group_count": 4
+    }
+  },
+  "limitations": "These are proxy subgroup reliability diagnostics, not a statutory fair-lending audit; protected attributes are absent.",
+  "metric_semantics": {
+    "false_positive_rate": "approval rate among actually bad/defaulted loans",
+    "favorable_decision": "action == approve",
+    "favorable_ground_truth_outcome": "good/repaid (1 - bad)",
+    "not_selected_actions": [
+      "manual_review",
+      "decline"
+    ],
+    "probability": "frozen calibrated default probability",
+    "roc_auc_and_brier_score_target": "bad=1 (default)",
+    "selection_rate": "overall approval rate",
+    "target": "bad=1 (default)",
+    "true_positive_rate": "approval rate among actually good/repaid loans"
+  },
+  "minimum_group_size": 200,
+  "schema_version": "1.0"
+}

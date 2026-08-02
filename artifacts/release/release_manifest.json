@@ -1,0 +1,137 @@
+{
+  "data_hash": "3eae03c28fd9d2e8a076ebeb73507e8d4d0f44d90500decdb0936e0933d1f36a",
+  "feature_set": "challenger",
+  "files": [
+    {
+      "key": "calibrated_model.joblib",
+      "media_type": "application/octet-stream",
+      "path": "calibrated_model.joblib",
+      "sha256": "9b8b33d5565972771cb6f023550df50f94382326432e5f575ac7b8d5e88f0d13",
+      "size_bytes": 4788675
+    },
+    {
+      "key": "calibration_curve.csv",
+      "media_type": "text/csv",
+      "path": "calibration_curve.csv",
+      "sha256": "8b6289280106900e4f0adb7c44905d95dd9759aa75e4c7543e4e1ac789847661",
+      "size_bytes": 1846
+    },
+    {
+      "key": "calibration_metrics.json",
+      "media_type": "application/json",
+      "path": "calibration_metrics.json",
+      "sha256": "4c7b01c83c19237a391a23758f2c757441295a41e46b642cf87e7ebcfa892e4a",
+      "size_bytes": 1130
+    },
+    {
+      "key": "confusion_matrix.csv",
+      "media_type": "text/csv",
+      "path": "confusion_matrix.csv",
+      "sha256": "726e38e5549c9220ee9a7d0792c3d5f51e180e13b29902dc6363c324844f4233",
+      "size_bytes": 68
+    },
+    {
+      "key": "cost_sensitivity.csv",
+      "media_type": "text/csv",
+      "path": "cost_sensitivity.csv",
+      "sha256": "5a2026fa9fcddb4b69007a2f0ca3de4a0216b48001758078f7e20d14d2999e23",
+      "size_bytes": 5091
+    },
+    {
+      "key": "fairness_employment.csv",
+      "media_type": "text/csv",
+      "path": "fairness_employment.csv",
+      "sha256": "a2cfbeb65a6178dea60b9c08b72d2951403080fbcf5f8705e7828d33a9f5a061",
+      "size_bytes": 1774
+    },
+    {
+      "key": "fairness_home_ownership.csv",
+      "media_type": "text/csv",
+      "path": "fairness_home_ownership.csv",
+      "sha256": "c6779b815c6e4fe95174b4458b1649804deb5819ab55628899ded97d1d195e4f",
+      "size_bytes": 536
+    },
+    {
+      "key": "fairness_income.csv",
+      "media_type": "text/csv",
+      "path": "fairness_income.csv",
+      "sha256": "68157f39247005635f4e88ace519d85508ead561c798f42a8792a9d31dbefff9",
+      "size_bytes": 811
+    },
+    {
+      "key": "fairness_region.csv",
+      "media_type": "text/csv",
+      "path": "fairness_region.csv",
+      "sha256": "92b86cef3ec699c14aad813fb9303d918f0343a6b73692054a869fd6ac33a12d",
+      "size_bytes": 659
+    },
+    {
+      "key": "fairness_summary.json",
+      "media_type": "application/json",
+      "path": "fairness_summary.json",
+      "sha256": "7c8e0ee626b255a733802ddeefa89523cafe186a045724a9c7da26b30b46aa57",
+      "size_bytes": 3580
+    },
+    {
+      "key": "final_test_metrics.json",
+      "media_type": "application/json",
+      "path": "final_test_metrics.json",
+      "sha256": "5f2919d71368bc3bf993e4b11e25d85c5bbc1ce4f9b010b975ee44e8b35132ea",
+      "size_bytes": 1968
+    },
+    {
+      "key": "policy.json",
+      "media_type": "application/json",
+      "path": "policy.json",
+      "sha256": "81a8c57f0fb59fd08ac4301456cd8458185721d6a65b8a03667c875d548bfb6b",
+      "size_bytes": 693
+    },
+    {
+      "key": "policy_test_results.json",
+      "media_type": "application/json",
+      "path": "policy_test_results.json",
+      "sha256": "a72da107a6316585d508acfea9a0ac5ac2de1a09cf7935fcf56f41d7e9cb4f98",
+      "size_bytes": 735
+    },
+    {
+      "key": "preprocessor.joblib",
+      "media_type": "application/octet-stream",
+      "path": "preprocessor.joblib",
+      "sha256": "b9a3f048fe2c043d0b0b80c96480cc4c76a6b9ad93a20ca2fe045bc1de73ed9f",
+      "size_bytes": 5696
+    },
+    {
+      "key": "shap_explanations.json",
+      "media_type": "application/json",
+      "path": "shap_explanations.json",
+      "sha256": "45037391680c37eb9bc788f2982fc2325254012621497a315cab3a7290c56587",
+      "size_bytes": 7540
+    },
+    {
+      "key": "shap_importance.csv",
+      "media_type": "text/csv",
+      "path": "shap_importance.csv",
+      "sha256": "f99b82792f099d1c503a0fb96f93ba19b2ad172d4686d6c85ac10deafdd14031",
+      "size_bytes": 4344
+    },
+    {
+      "key": "temporal_metrics.csv",
+      "media_type": "text/csv",
+      "path": "temporal_metrics.csv",
+      "sha256": "16bb94ac3b3e2985d57819cc964c614e44e4d547d80de37797f86124b7bd433b",
+      "size_bytes": 2882
+    },
+    {
+      "key": "validation_metrics.json",
+      "media_type": "application/json",
+      "path": "validation_metrics.json",
+      "sha256": "28c8466e1dcc494e6b99ba409ce794bf4cee3d96ac8126d0d0b2f68eb022e6a9",
+      "size_bytes": 6878
+    }
+  ],
+  "model_file": "calibrated_model.joblib",
+  "policy_file": "policy.json",
+  "preprocessor_file": "preprocessor.joblib",
+  "schema_version": "1.0",
+  "version": "0.1.0"
+}

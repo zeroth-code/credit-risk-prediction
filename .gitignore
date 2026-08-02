@@ -2,6 +2,9 @@
 __pycache__/
 .pytest_cache/
 .ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
 .streamlit/secrets.toml
 data/raw/*
 !data/raw/.gitkeep
