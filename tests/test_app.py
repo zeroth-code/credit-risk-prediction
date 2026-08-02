@@ -751,6 +751,21 @@ def test_load_release_artifacts_rejects_shap_contract_contradictions(
         demo.load_release_artifacts(release_dir)
 
 
+def test_load_release_artifacts_accepts_unavailable_local_action(tmp_path: Path) -> None:
+    payload = _production_shap_explanations_payload()
+    local_explanations = payload["local_explanations"]
+    assert isinstance(local_explanations, dict)
+    local_explanations["decline"] = None
+    release_dir = _create_release(
+        tmp_path,
+        shap_explanations_overrides=payload,
+    )
+
+    artifacts = demo.load_release_artifacts(release_dir)
+
+    assert artifacts.shap_explanations["local_explanations"]["decline"] is None
+
+
 @pytest.mark.parametrize("failure", ["missing", "tampered"])
 def test_load_release_artifacts_blocks_before_deserialization(
     tmp_path: Path,

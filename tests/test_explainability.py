@@ -200,7 +200,7 @@ def test_select_example_indices_requires_unique_nonnegative_integer_index(
         select_example_indices(scored)
 
 
-def test_select_example_indices_requires_every_policy_action() -> None:
+def test_select_example_indices_returns_only_observed_policy_actions() -> None:
     scored = pd.DataFrame(
         {
             "action": ["approve", "decline"],
@@ -208,8 +208,7 @@ def test_select_example_indices_requires_every_policy_action() -> None:
         }
     )
 
-    with pytest.raises(ValueError, match="no scored example for action: manual_review"):
-        select_example_indices(scored)
+    assert select_example_indices(scored) == {"approve": 0, "decline": 1}
 
 
 def test_sample_row_positions_is_capped_deterministic_and_keeps_required_rows() -> None:
@@ -357,6 +356,35 @@ def test_generate_shap_explanations_accepts_dense_transformed_matrix(tmp_path: P
 
     assert payload["sample"]["explained_rows"] == len(matrix)
     assert {path.name for path in (tmp_path / "figures").iterdir()} == FIGURE_FILENAMES
+
+
+def test_generate_shap_explanations_records_unavailable_policy_action(
+    tmp_path: Path,
+) -> None:
+    model, matrix, feature_names, scored = _explanation_inputs()
+    observed_mask = scored["action"] != "decline"
+    observed_scored = scored.loc[observed_mask].copy()
+    artifact_dir = tmp_path / "artifacts"
+    figure_dir = tmp_path / "figures"
+    figure_dir.mkdir()
+    obsolete_decline_waterfall = figure_dir / "shap_waterfall_decline.png"
+    obsolete_decline_waterfall.write_bytes(b"obsolete")
+
+    payload = generate_shap_explanations(
+        model,
+        matrix[observed_mask.to_numpy()],
+        feature_names,
+        observed_scored,
+        artifact_dir=artifact_dir,
+        figure_dir=figure_dir,
+    )
+
+    assert payload["local_explanations"]["decline"] is None
+    assert payload["files"]["waterfalls"] == {
+        "approve": "shap_waterfall_approve.png",
+        "manual_review": "shap_waterfall_manual_review.png",
+    }
+    assert not obsolete_decline_waterfall.exists()
 
 
 def test_generate_shap_explanations_preserves_published_outputs_on_render_failure(

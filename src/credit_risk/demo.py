@@ -447,6 +447,8 @@ def _validate_shap_explanations(payload: dict[str, Any]) -> None:
     for action in sorted(required_actions):
         example = local_explanations[action]
         artifact = f"shap_explanations.local_explanations.{action}"
+        if example is None:
+            continue
         if not isinstance(example, dict):
             raise ValueError(f"{artifact} must be an object")
         missing_fields = sorted(required_local_fields - set(example))

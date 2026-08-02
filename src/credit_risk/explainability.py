@@ -98,7 +98,7 @@ def select_example_indices(scored: pd.DataFrame) -> dict[str, int]:
     for action in POLICY_ACTIONS:
         group = scored.loc[scored["action"] == action]
         if group.empty:
-            raise ValueError(f"no scored example for action: {action}")
+            continue
         median_probability = group["probability"].median()
         distances = (group["probability"] - median_probability).abs()
         tied = distances == distances.min()
@@ -474,7 +474,9 @@ def generate_shap_explanations(
         }
         for rank, row in enumerate(ranked_features.itertuples(index=False), start=1)
     ]
-    waterfall_files = dict(SHAP_WATERFALL_FILENAMES)
+    waterfall_files = {
+        action: SHAP_WATERFALL_FILENAMES[action] for action in selected_indices
+    }
     global_top_features = [
         {
             "rank": int(row.rank),
@@ -489,6 +491,9 @@ def generate_shap_explanations(
     beeswarm_final = figure_path / SHAP_BEESWARM_FILENAME
     dependence_finals = [figure_path / item["filename"] for item in dependence_files]
     waterfall_finals = [figure_path / filename for filename in waterfall_files.values()]
+    known_waterfall_finals = [
+        figure_path / filename for filename in SHAP_WATERFALL_FILENAMES.values()
+    ]
     current_non_payload_finals = [
         importance_final,
         beeswarm_final,
@@ -499,7 +504,7 @@ def generate_shap_explanations(
         importance_final,
         beeswarm_final,
         *(figure_path / filename for filename in SHAP_DEPENDENCE_FILENAMES),
-        *waterfall_finals,
+        *known_waterfall_finals,
         payload_final,
     ]
     token = uuid4().hex
@@ -516,6 +521,8 @@ def generate_shap_explanations(
         figure_path / filename
         for filename in SHAP_DEPENDENCE_FILENAMES
         if figure_path / filename not in current_dependence_finals
+    ] + [
+        final_path for final_path in known_waterfall_finals if final_path not in waterfall_finals
     ]
 
     try:
@@ -568,9 +575,8 @@ def generate_shap_explanations(
         sample_lookup = {
             int(original): position for position, original in enumerate(sample_positions)
         }
-        local_explanations: dict[str, object] = {}
-        for action in POLICY_ACTIONS:
-            scored_index = selected_indices[action]
+        local_explanations: dict[str, object] = {action: None for action in POLICY_ACTIONS}
+        for action, scored_index in selected_indices.items():
             original_position = int(scored.index.get_loc(scored_index))
             explanation_position = sample_lookup[original_position]
             local_values = shap_values[explanation_position]
