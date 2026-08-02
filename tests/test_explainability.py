@@ -83,6 +83,26 @@ def test_select_example_indices_uses_lowest_index_for_median_ties() -> None:
     assert result == {"approve": 2, "manual_review": 1, "decline": 3}
 
 
+def test_select_example_indices_does_not_merge_nearby_distances_into_a_tie() -> None:
+    scored = pd.DataFrame(
+        {
+            "action": [
+                "approve",
+                "approve",
+                "approve",
+                "manual_review",
+                "decline",
+            ],
+            "probability": [0.2, 0.2000000000000005, 0.9, 0.5, 0.95],
+        },
+        index=[0, 5, 8, 1, 2],
+    )
+
+    result = select_example_indices(scored)
+
+    assert result["approve"] == 5
+
+
 @pytest.mark.parametrize("missing_column", ["action", "probability"])
 def test_select_example_indices_requires_scored_columns(missing_column: str) -> None:
     scored = pd.DataFrame(
@@ -247,7 +267,7 @@ def test_generate_shap_explanations_writes_stable_compact_artifacts(
     }
     assert set(payload["local_explanations"]) == {"approve", "manual_review", "decline"}
     for action, expected_index in {
-        "approve": 4,
+        "approve": 5,
         "manual_review": 14,
         "decline": 24,
     }.items():

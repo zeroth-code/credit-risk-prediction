@@ -98,12 +98,7 @@ def select_example_indices(scored: pd.DataFrame) -> dict[str, int]:
             raise ValueError(f"no scored example for action: {action}")
         median_probability = group["probability"].median()
         distances = (group["probability"] - median_probability).abs()
-        tied = np.isclose(
-            distances.to_numpy(dtype=float),
-            float(distances.min()),
-            rtol=1e-12,
-            atol=1e-15,
-        )
+        tied = distances == distances.min()
         index = min(distances.index[tied])
         selected[action] = int(index)
     return selected
