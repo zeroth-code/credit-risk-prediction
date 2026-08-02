@@ -4,6 +4,7 @@
 !.dockerignore
 !pyproject.toml
 !uv.lock
+!requirements.txt
 !app/
 !app/*.py
 !configs/

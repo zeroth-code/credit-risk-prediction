@@ -11,7 +11,7 @@ review while declining no applications.
 
 ## Live Demo and Screenshot
 
-The public deployment URL will be added after deployment. No URL is invented here.
+Live demo: <https://credit-risk-prediction-zeroth.streamlit.app/>
 
 ![Credit Risk Decision Lab scoring the pre-populated synthetic application](docs/assets/streamlit_demo.png)
 
@@ -245,6 +245,15 @@ uv run streamlit run app/streamlit_app.py
 Training runs the real 30-trial Optuna study and may take substantial time and memory. The
 scripts regenerate ignored processed data and model artifacts; they do not download the raw
 dataset.
+
+### Dependency files
+
+`uv.lock` is the source of truth for local development, CI, and the Docker image.
+`requirements.txt` exists only because Streamlit Community Cloud reads neither `pyproject.toml`
+nor `uv.lock`; it pins the subset of packages the deployed application imports. Because the
+release model is a joblib pickle, the deployed scikit-learn and LightGBM versions must match
+the versions that trained it, so `tests/test_requirements.py` fails when the two files drift.
+Regenerate the pins with `scripts/export_requirements.sh` after changing dependencies.
 
 ## Run Tests
 

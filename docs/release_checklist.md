@@ -14,7 +14,7 @@ Raw data snapshot SHA-256:
 | --- | --- |
 | `uv sync --locked --dev` | environment resolves from the committed lock file |
 | `uv run ruff check .` | `All checks passed!` |
-| `uv run pytest --cov=credit_risk --cov-report=term-missing` | 703 passed, 90% statement coverage |
+| `uv run pytest --cov=credit_risk --cov-report=term-missing` | 705 passed, 90% statement coverage |
 | `uv run python scripts/prepare_data.py` | four temporal Parquet partitions plus `population_audit.json` |
 | `uv run python scripts/train.py` | preprocessor, uncalibrated and calibrated models, tuning trials, policy |
 | `uv run python scripts/evaluate.py` | final test metrics, SHAP, fairness, and release manifest |
@@ -148,6 +148,22 @@ MET: `README.md` (all 18 required sections), `docs/data_card.md`, `docs/model_ca
 `docs/fairness_report.md`, `docs/case_study.md`, and this checklist. The README screenshot was
 captured from the container running the committed release bundle.
 
-NOT MET: the demonstration video and the three resume bullets are not in the repository, and no
-public deployment URL exists yet. The README states the deployment URL is pending rather than
-inventing one. These remain open before the portfolio is presented externally.
+NOT MET: the demonstration video and the three resume bullets are not in the repository. These
+remain open before the portfolio is presented externally.
+
+## Public deployment
+
+MET. Deployed to Streamlit Community Cloud at
+<https://credit-risk-prediction-zeroth.streamlit.app/> from the public repository, entry point
+`app/streamlit_app.py`.
+
+Community Cloud reads neither `pyproject.toml` nor `uv.lock`, so the first deployment installed
+no dependencies and the app failed with "Error running app". `requirements.txt` pins the
+runtime subset at the same versions as `uv.lock`, which matters because the release model is a
+joblib pickle and must be unpickled by the scikit-learn and LightGBM versions that trained it.
+
+Verified by rebuilding a `pip install -r requirements.txt` image with no uv involvement: the
+manifest hashes validated and the synthetic application scored 19.26% and routed to manual
+review, identical to the local and uv-based runs. `tests/test_requirements.py` fails if the
+pins drift from `uv.lock` or omit a runtime package; both failure modes were confirmed by
+temporarily corrupting the file.
