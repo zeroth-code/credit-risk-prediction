@@ -53,6 +53,7 @@ FAIRNESS_FILES = {
     "region": "fairness_region.csv",
     "employment": "fairness_employment.csv",
 }
+TEST_SCORING_PROBABILITY_SOURCE = "frozen_calibrated_model"
 
 
 class StartupError(RuntimeError):
@@ -102,12 +103,23 @@ class ReleaseArtifacts:
 @dataclass(frozen=True)
 class ExplanationView:
     label: str
+    source: str
     context: str
+    number_format: str
     table: pd.DataFrame
 
 
+@dataclass(frozen=True)
+class ExplanationEvidence:
+    rows: list[tuple[str, float]]
+    source: str
+    context: str
+    value_column: str
+    number_format: str
+
+
 def _load_json_object(path: Path) -> dict[str, Any]:
-    with path.open(encoding="utf-8") as input_file:
+    with path.open("r", encoding="utf-8") as input_file:
         payload = json.load(input_file)
     if not isinstance(payload, dict):
         raise ValueError(f"JSON artifact must contain an object: {path.name}")
@@ -183,52 +195,19 @@ def _parse_policy(payload: dict[str, Any]) -> Policy:
     )
 
 
-def load_release_artifacts(release_dir: str | Path = DEFAULT_RELEASE_DIR) -> ReleaseArtifacts:
-    release_path = Path(release_dir)
-    try:
-        manifest = validate_release_bundle(release_path)
-        if manifest.feature_set != "challenger":
-            raise ValueError("release feature_set must be challenger")
-
-        policy = _parse_policy(_load_json_object(release_path / manifest.policy_file))
-        preprocessor = joblib.load(release_path / manifest.preprocessor_file)
-        model = joblib.load(release_path / manifest.model_file)
-        fairness_tables = {
-            name: pd.read_csv(release_path / filename) for name, filename in FAIRNESS_FILES.items()
-        }
-        return ReleaseArtifacts(
-            release_dir=release_path,
-            manifest=manifest,
-            preprocessor=preprocessor,
-            model=model,
-            policy=policy,
-            validation_metrics=_load_json_object(release_path / "validation_metrics.json"),
-            calibration_metrics=_load_json_object(release_path / "calibration_metrics.json"),
-            calibration_curve=pd.read_csv(release_path / "calibration_curve.csv"),
-            cost_sensitivity=pd.read_csv(release_path / "cost_sensitivity.csv"),
-            final_test_metrics=_load_json_object(release_path / "final_test_metrics.json"),
-            confusion_matrix=pd.read_csv(release_path / "confusion_matrix.csv"),
-            policy_test_results=_load_json_object(release_path / "policy_test_results.json"),
-            temporal_metrics=pd.read_csv(release_path / "temporal_metrics.csv"),
-            fairness_tables=fairness_tables,
-            fairness_summary=_load_json_object(release_path / "fairness_summary.json"),
-            shap_importance=pd.read_csv(release_path / "shap_importance.csv"),
-            shap_explanations=_load_json_object(release_path / "shap_explanations.json"),
-        )
-    except Exception as exc:
-        if isinstance(exc, StartupError):
-            raise
-        raise StartupError(f"release bundle is unavailable or inconsistent: {exc}") from exc
-
-
-def _bad_class_probability(model: object, matrix: object) -> float:
+def _validated_model_classes(model: object) -> tuple[np.ndarray, int]:
+    if not callable(getattr(model, "predict_proba", None)):
+        raise ValueError("calibrated model must provide callable predict_proba")
     if not hasattr(model, "classes_"):
         raise ValueError("calibrated model must provide classes_")
-    classes = np.asarray(model.classes_)
+    try:
+        classes = np.asarray(model.classes_)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("calibrated model classes_ must contain labels 0 and 1") from exc
     if classes.ndim != 1 or len(classes) != 2:
         raise ValueError("calibrated model classes_ must contain two binary labels")
     if np.issubdtype(classes.dtype, np.bool_) or (
-        classes.dtype == object and any(isinstance(value, bool) for value in classes)
+        classes.dtype == object and any(isinstance(value, (bool, np.bool_)) for value in classes)
     ):
         raise ValueError("calibrated model classes_ must contain labels 0 and 1")
     try:
@@ -242,10 +221,210 @@ def _bad_class_probability(model: object, matrix: object) -> float:
     bad_indices = np.flatnonzero(classes == 1)
     if len(bad_indices) != 1:
         raise ValueError("calibrated model classes_ has an ambiguous bad class")
+    return classes, int(bad_indices[0])
 
-    predict_proba = getattr(model, "predict_proba", None)
-    if not callable(predict_proba):
-        raise ValueError("calibrated model must provide predict_proba")
+
+def _required_mapping(payload: dict[str, Any], field: str, artifact: str) -> dict[str, Any]:
+    value = payload.get(field)
+    if not isinstance(value, dict):
+        raise ValueError(f"{artifact} field {field} must be an object")
+    return value
+
+
+def _assert_artifact_value(
+    payload: dict[str, Any],
+    field: str,
+    expected: object,
+    *,
+    artifact: str,
+) -> None:
+    if field not in payload:
+        raise ValueError(f"{artifact} missing required field {field}")
+    actual = payload[field]
+    if isinstance(expected, float):
+        if isinstance(actual, bool):
+            matches = False
+        else:
+            try:
+                parsed = float(actual)
+            except (TypeError, ValueError):
+                matches = False
+            else:
+                matches = math.isfinite(parsed) and math.isclose(
+                    parsed, expected, rel_tol=1e-12, abs_tol=1e-12
+                )
+    else:
+        matches = actual == expected
+    if not matches:
+        raise ValueError(
+            f"{artifact} field {field} contradicts the frozen release: "
+            f"expected {expected!r}, found {actual!r}"
+        )
+
+
+def _validate_release_consistency(
+    manifest: ReleaseManifest,
+    policy: Policy,
+    validation_metrics: dict[str, Any],
+    calibration_metrics: dict[str, Any],
+    final_test_metrics: dict[str, Any],
+    policy_test_results: dict[str, Any],
+) -> None:
+    _assert_artifact_value(
+        validation_metrics,
+        "primary_feature_set",
+        manifest.feature_set,
+        artifact="validation_metrics",
+    )
+
+    calibration_expectations = {
+        "selected_method": policy.selected_calibration_method,
+        "evaluation_protocol": policy.calibration_evaluation_protocol,
+        "evaluation_partition": policy.selection_partition,
+    }
+    for field, expected in calibration_expectations.items():
+        _assert_artifact_value(
+            calibration_metrics,
+            field,
+            expected,
+            artifact="calibration_metrics",
+        )
+    calibration_artifact = _required_mapping(calibration_metrics, "artifact", "calibration_metrics")
+    _assert_artifact_value(
+        calibration_artifact,
+        "method",
+        policy.selected_calibration_method,
+        artifact="calibration_metrics.artifact",
+    )
+    methods = _required_mapping(calibration_metrics, "methods", "calibration_metrics")
+    selected_metrics = _required_mapping(
+        methods, policy.selected_calibration_method, "calibration_metrics.methods"
+    )
+    _assert_artifact_value(
+        selected_metrics,
+        "probability_source",
+        policy.probability_source,
+        artifact=f"calibration_metrics.methods.{policy.selected_calibration_method}",
+    )
+
+    policy_expectations = {
+        "approve_below": policy.approve_below,
+        "decline_at": policy.decline_at,
+        "lgd": policy.lgd,
+        "margin": policy.margin,
+        "review_cost": policy.review_cost,
+        "currency": policy.currency,
+        "selected_calibration_method": policy.selected_calibration_method,
+        "threshold_selection_probability_source": policy.probability_source,
+        "selection_partition": policy.selection_partition,
+        "threshold_selection_protocol": policy.threshold_selection_protocol,
+        "calibration_evaluation_protocol": policy.calibration_evaluation_protocol,
+        "test_scoring_probability_source": TEST_SCORING_PROBABILITY_SOURCE,
+    }
+    for field, expected in policy_expectations.items():
+        _assert_artifact_value(
+            policy_test_results,
+            field,
+            expected,
+            artifact="policy_test_results",
+        )
+
+    model_provenance = _required_mapping(
+        final_test_metrics, "model_provenance", "final_test_metrics"
+    )
+    model_expectations = {
+        "feature_set": manifest.feature_set,
+        "evaluation_partition": "test",
+        "preprocessor_artifact": manifest.preprocessor_file,
+        "model_artifact": manifest.model_file,
+        "test_scoring_probability_source": TEST_SCORING_PROBABILITY_SOURCE,
+    }
+    for field, expected in model_expectations.items():
+        _assert_artifact_value(
+            model_provenance,
+            field,
+            expected,
+            artifact="final_test_metrics.model_provenance",
+        )
+
+    policy_provenance = _required_mapping(
+        final_test_metrics, "policy_provenance", "final_test_metrics"
+    )
+    final_policy_expectations = {
+        "policy_artifact": manifest.policy_file,
+        "approve_below": policy.approve_below,
+        "decline_at": policy.decline_at,
+        "selected_calibration_method": policy.selected_calibration_method,
+        "threshold_selection_probability_source": policy.probability_source,
+        "calibration_evaluation_protocol": policy.calibration_evaluation_protocol,
+        "selection_partition": policy.selection_partition,
+        "threshold_selection_protocol": policy.threshold_selection_protocol,
+    }
+    for field, expected in final_policy_expectations.items():
+        _assert_artifact_value(
+            policy_provenance,
+            field,
+            expected,
+            artifact="final_test_metrics.policy_provenance",
+        )
+
+
+def load_release_artifacts(release_dir: str | Path = DEFAULT_RELEASE_DIR) -> ReleaseArtifacts:
+    release_path = Path(release_dir)
+    try:
+        manifest = validate_release_bundle(release_path)
+        if manifest.feature_set != "challenger":
+            raise ValueError("release feature_set must be challenger")
+
+        policy = _parse_policy(_load_json_object(release_path / manifest.policy_file))
+        validation_metrics = _load_json_object(release_path / "validation_metrics.json")
+        calibration_metrics = _load_json_object(release_path / "calibration_metrics.json")
+        final_test_metrics = _load_json_object(release_path / "final_test_metrics.json")
+        policy_test_results = _load_json_object(release_path / "policy_test_results.json")
+        preprocessor = joblib.load(release_path / manifest.preprocessor_file)
+        model = joblib.load(release_path / manifest.model_file)
+        if not callable(getattr(preprocessor, "transform", None)):
+            raise ValueError("frozen preprocessor must provide callable transform")
+        _validated_model_classes(model)
+        _validate_release_consistency(
+            manifest,
+            policy,
+            validation_metrics,
+            calibration_metrics,
+            final_test_metrics,
+            policy_test_results,
+        )
+        fairness_tables = {
+            name: pd.read_csv(release_path / filename) for name, filename in FAIRNESS_FILES.items()
+        }
+        return ReleaseArtifacts(
+            release_dir=release_path,
+            manifest=manifest,
+            preprocessor=preprocessor,
+            model=model,
+            policy=policy,
+            validation_metrics=validation_metrics,
+            calibration_metrics=calibration_metrics,
+            calibration_curve=pd.read_csv(release_path / "calibration_curve.csv"),
+            cost_sensitivity=pd.read_csv(release_path / "cost_sensitivity.csv"),
+            final_test_metrics=final_test_metrics,
+            confusion_matrix=pd.read_csv(release_path / "confusion_matrix.csv"),
+            policy_test_results=policy_test_results,
+            temporal_metrics=pd.read_csv(release_path / "temporal_metrics.csv"),
+            fairness_tables=fairness_tables,
+            fairness_summary=_load_json_object(release_path / "fairness_summary.json"),
+            shap_importance=pd.read_csv(release_path / "shap_importance.csv"),
+            shap_explanations=_load_json_object(release_path / "shap_explanations.json"),
+        )
+    except Exception as exc:
+        if isinstance(exc, StartupError):
+            raise
+        raise StartupError(f"release bundle is unavailable or inconsistent: {exc}") from exc
+
+
+def _bad_class_probability(model: object, matrix: object) -> float:
+    _, bad_index = _validated_model_classes(model)
+    predict_proba = model.predict_proba  # type: ignore[attr-defined]
     try:
         probabilities = np.asarray(predict_proba(matrix), dtype=float)
     except (TypeError, ValueError) as exc:
@@ -258,13 +437,13 @@ def _bad_class_probability(model: object, matrix: object) -> float:
         raise ValueError("calibrated model probabilities must be between 0 and 1")
     if not np.allclose(probabilities.sum(axis=1), 1.0, rtol=1e-7, atol=1e-8):
         raise ValueError("calibrated model probabilities must sum to 1")
-    return float(probabilities[0, int(bad_indices[0])])
+    return float(probabilities[0, bad_index])
 
 
 def _release_example_explanation(
     artifacts: ReleaseArtifacts,
     action: str,
-) -> list[tuple[str, float]]:
+) -> ExplanationEvidence:
     local_explanations = artifacts.shap_explanations.get("local_explanations")
     if isinstance(local_explanations, dict):
         example = local_explanations.get(action)
@@ -289,7 +468,16 @@ def _release_example_explanation(
                         if math.isfinite(parsed_value):
                             rows.append((feature.strip(), parsed_value))
                 if rows:
-                    return rows
+                    return ExplanationEvidence(
+                        rows=rows,
+                        source="local_action_example",
+                        context=(
+                            "Frozen release example for the assigned action; these directional "
+                            "SHAP values were not generated for the entered application."
+                        ),
+                        value_column="Directional association (SHAP value)",
+                        number_format="%+.4f",
+                    )
 
     rows = []
     required_columns = {"feature", "mean_abs_shap"}
@@ -297,11 +485,22 @@ def _release_example_explanation(
         for row in artifacts.shap_importance.loc[:, ["feature", "mean_abs_shap"]].itertuples(
             index=False
         ):
-            if isinstance(row.feature, str) and math.isfinite(float(row.mean_abs_shap)):
-                rows.append((row.feature.strip(), float(row.mean_abs_shap)))
+            if isinstance(row.feature, str) and row.feature.strip():
+                value = float(row.mean_abs_shap)
+                if math.isfinite(value) and value >= 0.0:
+                    rows.append((row.feature.strip(), value))
     if not rows:
         raise ValueError("release explanation payload contains no usable associations")
-    return rows[:5]
+    return ExplanationEvidence(
+        rows=rows[:5],
+        source="global_mean_absolute_importance",
+        context=(
+            "Global unsigned mean absolute SHAP association/importance; this is not a local "
+            "explanation, is not directional, and is not action-specific."
+        ),
+        value_column="Mean absolute association (unsigned)",
+        number_format="%.4f",
+    )
 
 
 def predict_application(
@@ -336,7 +535,7 @@ def predict_application(
         return CreditPrediction(
             default_probability=float(probability),
             action=action,
-            explanation=[(feature, float(value)) for feature, value in explanation],
+            explanation=[(feature, float(value)) for feature, value in explanation.rows],
         )
     except Exception as exc:
         if isinstance(exc, PredictionError):
@@ -346,15 +545,18 @@ def predict_application(
 
 def explanation_view(
     prediction: CreditPrediction,
-    _artifacts: ReleaseArtifacts,
+    artifacts: ReleaseArtifacts,
 ) -> ExplanationView:
+    evidence = _release_example_explanation(artifacts, prediction.action)
     return ExplanationView(
         label=ASSOCIATION_LABEL,
-        context=(
-            "Frozen release example for the assigned action; these values were not generated "
-            "for the entered application."
+        source=evidence.source,
+        context=evidence.context,
+        number_format=evidence.number_format,
+        table=pd.DataFrame(
+            prediction.explanation,
+            columns=["Feature", evidence.value_column],
         ),
-        table=pd.DataFrame(prediction.explanation, columns=["Feature", "Association"]),
     )
 
 
@@ -715,7 +917,9 @@ def _render_result(
         hide_index=True,
         width="stretch",
         column_config={
-            "Association": st.column_config.NumberColumn(format="%+.4f"),
+            explanation.table.columns[1]: st.column_config.NumberColumn(
+                format=explanation.number_format
+            ),
         },
     )
 
@@ -795,6 +999,74 @@ def _render_line_chart(frame: pd.DataFrame, *, y_title: str) -> bool:
     return True
 
 
+def _render_calibration_chart(curve: pd.DataFrame) -> bool:
+    required = {"mean_probability", "observed_default_rate"}
+    if not required.issubset(curve.columns):
+        return False
+    paired = pd.DataFrame(
+        {
+            "mean_probability": pd.to_numeric(curve["mean_probability"], errors="coerce"),
+            "observed_default_rate": pd.to_numeric(curve["observed_default_rate"], errors="coerce"),
+            "method": curve["method"].astype(str) if "method" in curve.columns else "calibration",
+        }
+    )
+    finite = np.isfinite(paired["mean_probability"]) & np.isfinite(paired["observed_default_rate"])
+    paired = paired.loc[finite]
+    if paired.empty:
+        return False
+
+    figure = go.Figure()
+    colors = ["#078A8C", "#D99A00", "#D64545"]
+    for index, (method, method_rows) in enumerate(paired.groupby("method", sort=False)):
+        method_rows = method_rows.sort_values("mean_probability", kind="stable")
+        figure.add_trace(
+            go.Scatter(
+                x=method_rows["mean_probability"],
+                y=method_rows["observed_default_rate"],
+                mode="lines+markers",
+                name=str(method).replace("_", " ").title(),
+                line={"color": colors[index % len(colors)], "width": 2},
+                marker={"size": 7},
+            )
+        )
+    figure.add_trace(
+        go.Scatter(
+            x=[0.0, 1.0],
+            y=[0.0, 1.0],
+            mode="lines",
+            name="Perfect calibration",
+            line={"color": "#5F6B76", "width": 1.5, "dash": "dash"},
+        )
+    )
+    figure.update_layout(
+        height=330,
+        margin={"l": 52, "r": 20, "t": 22, "b": 52},
+        paper_bgcolor="#FFFFFF",
+        plot_bgcolor="#FFFFFF",
+        font={"color": "#17202A", "size": 12},
+        legend={"orientation": "h", "y": 1.12, "x": 0},
+        xaxis={
+            "title": "Mean predicted probability",
+            "range": [0.0, 1.0],
+            "gridcolor": "#E8EDF1",
+            "zeroline": False,
+        },
+        yaxis={
+            "title": "Observed default rate",
+            "range": [0.0, 1.0],
+            "gridcolor": "#E8EDF1",
+            "zeroline": False,
+        },
+        hovermode="closest",
+    )
+    st.plotly_chart(
+        figure,
+        width="stretch",
+        config={"displayModeBar": False, "responsive": True},
+    )
+    return True
+
+
 def _render_model_performance(artifacts: ReleaseArtifacts) -> None:
     st.subheader("Final out-of-time performance")
     st.dataframe(_metric_rows(artifacts.final_test_metrics), hide_index=True, width="stretch")
@@ -833,13 +1105,7 @@ def _render_calibration(artifacts: ReleaseArtifacts) -> None:
         f"{float(ece):.3f}" if isinstance(ece, (int, float)) else "Unavailable",
     )
     curve = artifacts.calibration_curve.copy()
-    required = {"mean_probability", "observed_default_rate"}
-    if required.issubset(curve.columns):
-        chart = curve.loc[:, ["mean_probability", "observed_default_rate"]].apply(
-            pd.to_numeric, errors="coerce"
-        )
-        _render_line_chart(chart, y_title="Default rate")
-    else:
+    if not _render_calibration_chart(curve):
         st.info("Calibration curve values are unavailable in this release.")
     st.dataframe(curve, hide_index=True, width="stretch")
     with st.expander("Calibration metadata"):

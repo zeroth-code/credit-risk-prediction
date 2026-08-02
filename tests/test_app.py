@@ -1,3 +1,4 @@
+import ast
 import importlib.util
 import inspect
 import json
@@ -50,7 +51,7 @@ class FixedProbabilityModel:
     def __init__(
         self,
         *,
-        classes: tuple[int, int] = (0, 1),
+        classes: object = (0, 1),
         probabilities: tuple[float, float] = (0.8, 0.2),
     ) -> None:
         self.classes_ = np.asarray(classes)
@@ -65,6 +66,14 @@ class MissingClassesModel:
         return np.array([[0.8, 0.2]])
 
 
+class MissingPredictProbaModel:
+    classes_ = np.array([0, 1])
+
+
+class MissingTransformPreprocessor:
+    pass
+
+
 def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
 
@@ -75,6 +84,11 @@ def _create_release(
     model: object | None = None,
     preprocessor: object | None = None,
     policy_overrides: dict[str, object] | None = None,
+    validation_metrics_overrides: dict[str, object] | None = None,
+    calibration_metrics_overrides: dict[str, object] | None = None,
+    final_metrics_overrides: dict[str, object] | None = None,
+    policy_results_overrides: dict[str, object] | None = None,
+    shap_explanations_overrides: dict[str, object] | None = None,
 ) -> Path:
     source_dir = tmp_path / "artifacts"
     source_dir.mkdir()
@@ -95,35 +109,71 @@ def _create_release(
     }
     policy.update(policy_overrides or {})
     _write_json(source_dir / "policy.json", policy)
-    _write_json(source_dir / "validation_metrics.json", {"primary_feature_set": "challenger"})
-    _write_json(
-        source_dir / "calibration_metrics.json",
-        {"selected_method": "sigmoid", "methods": {}},
-    )
-    _write_json(
-        source_dir / "final_test_metrics.json",
-        {
-            "test_samples": 120,
-            "predictive_metrics": {"roc_auc": 0.74, "brier_score": 0.08},
-            "expected_calibration_error": 0.03,
-            "confidence_intervals": {
-                "roc_auc": {"lower": 0.70, "upper": 0.78},
-                "brier_score": {"lower": 0.06, "upper": 0.10},
-            },
+    validation_metrics = {"primary_feature_set": "challenger"}
+    validation_metrics.update(validation_metrics_overrides or {})
+    _write_json(source_dir / "validation_metrics.json", validation_metrics)
+    calibration_metrics = {
+        "selected_method": policy["selected_calibration_method"],
+        "evaluation_protocol": policy["calibration_evaluation_protocol"],
+        "evaluation_partition": "calibration",
+        "artifact": {"method": policy["selected_calibration_method"]},
+        "methods": {
+            str(policy["selected_calibration_method"]): {
+                "status": "ok",
+                "probability_source": policy["probability_source"],
+            }
         },
-    )
-    _write_json(
-        source_dir / "policy_test_results.json",
-        {
-            "approve_below": 0.25,
-            "decline_at": 0.65,
-            "test_cost_per_1000_applications": 1500.0,
-            "currency": "USD",
-            "test_approval_rate": 0.55,
-            "test_review_rate": 0.25,
-            "test_decline_rate": 0.20,
+    }
+    calibration_metrics.update(calibration_metrics_overrides or {})
+    _write_json(source_dir / "calibration_metrics.json", calibration_metrics)
+    final_metrics = {
+        "test_samples": 120,
+        "predictive_metrics": {"roc_auc": 0.74, "brier_score": 0.08},
+        "expected_calibration_error": 0.03,
+        "confidence_intervals": {
+            "roc_auc": {"lower": 0.70, "upper": 0.78},
+            "brier_score": {"lower": 0.06, "upper": 0.10},
         },
-    )
+        "model_provenance": {
+            "feature_set": "challenger",
+            "evaluation_partition": "test",
+            "preprocessor_artifact": "preprocessor.joblib",
+            "model_artifact": "calibrated_model.joblib",
+            "test_scoring_probability_source": "frozen_calibrated_model",
+        },
+        "policy_provenance": {
+            "policy_artifact": "policy.json",
+            "approve_below": policy["approve_below"],
+            "decline_at": policy["decline_at"],
+            "selected_calibration_method": policy["selected_calibration_method"],
+            "threshold_selection_probability_source": policy["probability_source"],
+            "calibration_evaluation_protocol": policy["calibration_evaluation_protocol"],
+            "selection_partition": policy["selection_partition"],
+            "threshold_selection_protocol": policy["threshold_selection_protocol"],
+        },
+    }
+    final_metrics.update(final_metrics_overrides or {})
+    _write_json(source_dir / "final_test_metrics.json", final_metrics)
+    policy_results = {
+        "approve_below": policy["approve_below"],
+        "decline_at": policy["decline_at"],
+        "lgd": policy["lgd"],
+        "margin": policy["margin"],
+        "review_cost": policy["review_cost"],
+        "currency": policy["currency"],
+        "selected_calibration_method": policy["selected_calibration_method"],
+        "threshold_selection_probability_source": policy["probability_source"],
+        "selection_partition": policy["selection_partition"],
+        "threshold_selection_protocol": policy["threshold_selection_protocol"],
+        "calibration_evaluation_protocol": policy["calibration_evaluation_protocol"],
+        "test_scoring_probability_source": "frozen_calibrated_model",
+        "test_cost_per_1000_applications": 1500.0,
+        "test_approval_rate": 0.55,
+        "test_review_rate": 0.25,
+        "test_decline_rate": 0.20,
+    }
+    policy_results.update(policy_results_overrides or {})
+    _write_json(source_dir / "policy_test_results.json", policy_results)
     _write_json(
         source_dir / "fairness_summary.json",
         {
@@ -133,35 +183,34 @@ def _create_release(
             "attributes": {},
         },
     )
-    _write_json(
-        source_dir / "shap_explanations.json",
-        {
-            "schema_version": "1.0",
-            "explanation_model": {
-                "output_space": "raw_model_output",
-                "units": "log_odds",
-                "calibration_note": "Example explanations use the frozen base model.",
-            },
-            "local_explanations": {
-                action: {
-                    "policy_action": action,
-                    "calibrated_probability": probability,
-                    "top_contributions": [
-                        {
-                            "feature": "numeric__dti",
-                            "feature_value": 28.0,
-                            "shap_value": contribution,
-                        }
-                    ],
-                }
-                for action, probability, contribution in (
-                    ("approve", 0.12, -0.4),
-                    ("manual_review", 0.45, 0.2),
-                    ("decline", 0.78, 0.6),
-                )
-            },
+    shap_explanations = {
+        "schema_version": "1.0",
+        "explanation_model": {
+            "output_space": "raw_model_output",
+            "units": "log_odds",
+            "calibration_note": "Example explanations use the frozen base model.",
         },
-    )
+        "local_explanations": {
+            action: {
+                "policy_action": action,
+                "calibrated_probability": probability,
+                "top_contributions": [
+                    {
+                        "feature": "numeric__dti",
+                        "feature_value": 28.0,
+                        "shap_value": contribution,
+                    }
+                ],
+            }
+            for action, probability, contribution in (
+                ("approve", 0.12, -0.4),
+                ("manual_review", 0.45, 0.2),
+                ("decline", 0.78, 0.6),
+            )
+        },
+    }
+    shap_explanations.update(shap_explanations_overrides or {})
+    _write_json(source_dir / "shap_explanations.json", shap_explanations)
     (source_dir / "calibration_curve.csv").write_text(
         "method,bin_index,mean_probability,observed_default_rate,sample_count\n"
         "sigmoid,0,0.10,0.12,50\n",
@@ -227,6 +276,10 @@ def _application_payload() -> dict[str, object]:
         "emp_length": " 5+ years ",
         "addr_state": " tx ",
     }
+
+
+def _snapshot_files(paths: list[Path]) -> dict[Path, bytes]:
+    return {path: path.read_bytes() for path in paths if path.is_file()}
 
 
 def test_streamlit_app_module_exists() -> None:
@@ -305,6 +358,82 @@ def test_load_release_artifacts_rejects_contradictory_policy_provenance(
         streamlit_app.load_release_artifacts(release_dir)
 
 
+@pytest.mark.parametrize(
+    ("release_kwargs", "message"),
+    [
+        ({"model": MissingClassesModel()}, "classes_"),
+        ({"model": FixedProbabilityModel(classes=(0, 2))}, "classes_"),
+        ({"model": FixedProbabilityModel(classes=(1, 1))}, "classes_"),
+        (
+            {"model": FixedProbabilityModel(classes=np.array([np.bool_(False), 1], dtype=object))},
+            "classes_",
+        ),
+        ({"model": MissingPredictProbaModel()}, "predict_proba"),
+        ({"preprocessor": MissingTransformPreprocessor()}, "transform"),
+    ],
+    ids=[
+        "missing-classes",
+        "non-binary-classes",
+        "ambiguous-classes",
+        "boolean-classes",
+        "missing-predict-proba",
+        "missing-transform",
+    ],
+)
+def test_load_release_artifacts_rejects_invalid_frozen_components(
+    tmp_path: Path,
+    release_kwargs: dict[str, object],
+    message: str,
+) -> None:
+    release_dir = _create_release(tmp_path, **release_kwargs)
+
+    with pytest.raises(streamlit_app.StartupError, match=message):
+        streamlit_app.load_release_artifacts(release_dir)
+
+
+@pytest.mark.parametrize(
+    ("release_kwargs", "message"),
+    [
+        (
+            {"calibration_metrics_overrides": {"selected_method": "isotonic"}},
+            "selected_method",
+        ),
+        (
+            {"policy_results_overrides": {"decline_at": 0.75}},
+            "policy_test_results.*decline_at",
+        ),
+        (
+            {"validation_metrics_overrides": {"primary_feature_set": "full_underwriting"}},
+            "primary_feature_set",
+        ),
+        (
+            {
+                "final_metrics_overrides": {
+                    "model_provenance": {
+                        "feature_set": "challenger",
+                        "evaluation_partition": "test",
+                        "preprocessor_artifact": "preprocessor.joblib",
+                        "model_artifact": "different-model.joblib",
+                        "test_scoring_probability_source": "frozen_calibrated_model",
+                    }
+                }
+            },
+            "model_provenance.*model_artifact",
+        ),
+    ],
+    ids=["calibration-method", "policy-threshold", "validation-feature-set", "model-role"],
+)
+def test_load_release_artifacts_rejects_cross_artifact_contradictions(
+    tmp_path: Path,
+    release_kwargs: dict[str, object],
+    message: str,
+) -> None:
+    release_dir = _create_release(tmp_path, **release_kwargs)
+
+    with pytest.raises(streamlit_app.StartupError, match=message):
+        streamlit_app.load_release_artifacts(release_dir)
+
+
 @pytest.mark.parametrize("failure", ["missing", "tampered"])
 def test_load_release_artifacts_blocks_before_deserialization(
     tmp_path: Path,
@@ -378,26 +507,6 @@ def test_predict_application_constructs_strict_credit_application(tmp_path: Path
         streamlit_app.predict_application(invalid_payload, artifacts)
 
 
-@pytest.mark.parametrize(
-    "model",
-    [
-        MissingClassesModel(),
-        FixedProbabilityModel(classes=(0, 2)),
-        FixedProbabilityModel(classes=(1, 1)),
-    ],
-    ids=["missing", "non-binary", "ambiguous"],
-)
-def test_predict_application_rejects_missing_nonbinary_or_ambiguous_bad_class(
-    tmp_path: Path,
-    model: object,
-) -> None:
-    release_dir = _create_release(tmp_path, model=model)
-    artifacts = streamlit_app.load_release_artifacts(release_dir)
-
-    with pytest.raises(streamlit_app.PredictionError, match="classes_"):
-        streamlit_app.predict_application(_application_payload(), artifacts)
-
-
 def test_predict_application_uses_frozen_policy_assignment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -442,11 +551,190 @@ def test_explanation_view_labels_release_example_as_association(tmp_path: Path) 
     explanation = streamlit_app.explanation_view(prediction, artifacts)
 
     assert explanation.label == "Associations, not causal effects"
-    assert "example" in explanation.context.lower()
+    assert explanation.source == "local_action_example"
+    assert explanation.number_format == "%+.4f"
+    assert "assigned action" in explanation.context.lower()
     assert "not generated for the entered application" in explanation.context.lower()
     assert explanation.table.to_dict("records") == [
-        {"Feature": "numeric__dti", "Association": -0.4}
+        {"Feature": "numeric__dti", "Directional association (SHAP value)": -0.4}
     ]
+
+
+def test_explanation_view_labels_global_fallback_as_unsigned_not_local_or_action_specific(
+    tmp_path: Path,
+) -> None:
+    release_dir = _create_release(
+        tmp_path,
+        shap_explanations_overrides={"local_explanations": {}},
+    )
+    artifacts = streamlit_app.load_release_artifacts(release_dir)
+    prediction = streamlit_app.predict_application(_application_payload(), artifacts)
+
+    explanation = streamlit_app.explanation_view(prediction, artifacts)
+
+    assert explanation.label == "Associations, not causal effects"
+    assert explanation.source == "global_mean_absolute_importance"
+    assert explanation.number_format == "%.4f"
+    assert "global unsigned mean absolute" in explanation.context.lower()
+    assert "not a local explanation" in explanation.context.lower()
+    assert "not directional" in explanation.context.lower()
+    assert "not action-specific" in explanation.context.lower()
+    assert explanation.table.to_dict("records") == [
+        {"Feature": "numeric__dti", "Mean absolute association (unsigned)": 0.4}
+    ]
+
+
+def test_calibration_chart_uses_mean_probability_for_x_and_observed_rate_for_y(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[object] = []
+
+    def capture_chart(figure: object, **_kwargs: object) -> None:
+        captured.append(figure)
+
+    monkeypatch.setattr(streamlit_app.st, "plotly_chart", capture_chart)
+    curve = pd.DataFrame(
+        {
+            "method": ["sigmoid", "sigmoid", "sigmoid", "sigmoid"],
+            "mean_probability": [0.10, 0.35, np.nan, 0.80],
+            "observed_default_rate": [0.12, 0.30, 0.55, np.inf],
+        }
+    )
+
+    rendered = streamlit_app._render_calibration_chart(curve)
+
+    assert rendered is True
+    assert len(captured) == 1
+    figure = captured[0]
+    assert len(figure.data) == 2
+    calibration_trace, reference_trace = figure.data
+    assert calibration_trace.name == "Sigmoid"
+    np.testing.assert_allclose(calibration_trace.x, [0.10, 0.35])
+    np.testing.assert_allclose(calibration_trace.y, [0.12, 0.30])
+    assert reference_trace.name == "Perfect calibration"
+    np.testing.assert_allclose(reference_trace.x, [0.0, 1.0])
+    np.testing.assert_allclose(reference_trace.y, [0.0, 1.0])
+    assert reference_trace.line.dash == "dash"
+
+
+def test_calibration_chart_reports_unavailable_when_no_finite_pairs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden_chart(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("an unavailable calibration curve must not render a chart")
+
+    monkeypatch.setattr(streamlit_app.st, "plotly_chart", forbidden_chart)
+    curve = pd.DataFrame(
+        {
+            "mean_probability": [np.nan, "invalid"],
+            "observed_default_rate": [0.2, np.inf],
+        }
+    )
+
+    assert streamlit_app._render_calibration_chart(curve) is False
+
+
+def test_streamlit_app_uses_only_explicit_read_file_apis() -> None:
+    tree = ast.parse(APP_PATH.read_text(encoding="utf-8"))
+    prohibited_calls = {
+        "dump",
+        "set_query_params",
+        "to_csv",
+        "to_json",
+        "to_parquet",
+        "write_bytes",
+        "write_text",
+    }
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        assert node.func.attr not in prohibited_calls
+        if node.func.attr != "open":
+            continue
+        positional_mode = (
+            node.args[0].value if node.args and isinstance(node.args[0], ast.Constant) else None
+        )
+        keyword_mode = next(
+            (
+                keyword.value.value
+                for keyword in node.keywords
+                if keyword.arg == "mode" and isinstance(keyword.value, ast.Constant)
+            ),
+            None,
+        )
+        assert positional_mode in {"r", "rb"} or keyword_mode in {"r", "rb"}
+
+
+def test_streamlit_nondefault_assessment_does_not_persist_inputs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_dir = _create_release(tmp_path)
+    sentinel = tmp_path / "fixture-sentinel.txt"
+    sentinel.write_text("unchanged\n", encoding="utf-8")
+    monkeypatch.setenv("CREDIT_RISK_RELEASE_DIR", str(release_dir))
+    tracked_result = subprocess.run(
+        ["git", "ls-files"],
+        cwd=PROJECT_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    tracked_paths = [PROJECT_ROOT / line for line in tracked_result.stdout.splitlines()]
+    fixture_paths = [path for path in tmp_path.rglob("*") if path.is_file()]
+    tracked_before = _snapshot_files(tracked_paths)
+    fixture_before = _snapshot_files(fixture_paths)
+    status_before = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=PROJECT_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+
+    app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+    nondefault_numbers = [
+        12_345.0,
+        91_000.0,
+        17.5,
+        705.0,
+        745.0,
+        0.0,
+        1.0,
+        11.0,
+        2.0,
+        8_765.0,
+        48.0,
+        24.0,
+    ]
+    for widget, value in zip(app.number_input, nondefault_numbers, strict=True):
+        widget.set_value(value)
+    for widget, value in zip(
+        app.selectbox,
+        ["home_improvement", "OWN", "Not Verified", "2 years"],
+        strict=True,
+    ):
+        widget.set_value(value)
+    app.text_input[0].set_value("CA")
+
+    app = app.button[0].click().run(timeout=10)
+
+    assert not app.exception
+    assert app.query_params == {}
+    rendered_text = "\n".join(element.value for element in app.markdown)
+    assert "20.00%" in rendered_text
+    assert _snapshot_files(tracked_paths) == tracked_before
+    fixture_after_paths = [path for path in tmp_path.rglob("*") if path.is_file()]
+    assert _snapshot_files(fixture_after_paths) == fixture_before
+    status_after = subprocess.run(
+        ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+        cwd=PROJECT_ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert status_after == status_before
 
 
 def test_streamlit_startup_error_blocks_prediction_workflow(
@@ -460,6 +748,21 @@ def test_streamlit_startup_error_blocks_prediction_workflow(
     assert not app.exception
     assert len(app.error) == 1
     assert "release bundle" in app.error[0].value.lower()
+    assert not app.button
+
+
+def test_streamlit_untrusted_component_blocks_prediction_workflow(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_dir = _create_release(tmp_path, model=MissingClassesModel())
+    monkeypatch.setenv("CREDIT_RISK_RELEASE_DIR", str(release_dir))
+
+    app = AppTest.from_file(str(APP_PATH)).run(timeout=10)
+
+    assert not app.exception
+    assert len(app.error) == 1
+    assert "classes_" in app.error[0].value
     assert not app.button
 
 
