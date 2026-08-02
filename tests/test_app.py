@@ -364,6 +364,18 @@ def test_streamlit_app_module_exists() -> None:
     assert APP_PATH.is_file()
 
 
+def test_threshold_caption_states_the_reported_threshold() -> None:
+    caption = streamlit_app._threshold_caption({"classification_threshold": 0.05})
+
+    assert "0.05" in caption
+    assert "not at 0.5" in caption
+
+
+def test_threshold_caption_flags_a_missing_threshold() -> None:
+    assert "unrecorded" in streamlit_app._threshold_caption({})
+    assert "unrecorded" in streamlit_app._threshold_caption({"classification_threshold": True})
+
+
 def test_streamlit_script_imports_project_package_without_pytest_pythonpath() -> None:
     code = f"""
 import importlib.util

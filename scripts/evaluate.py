@@ -25,7 +25,11 @@ from credit_risk.metrics import binary_metrics, bootstrap_metric  # noqa: E402
 
 BASE_CONFIG_PATH = PROJECT_ROOT / "configs/base.yaml"
 FEATURE_DICTIONARY_PATH = PROJECT_ROOT / "configs/features.yaml"
-CLASSIFICATION_THRESHOLD = 0.5
+# Threshold-dependent metrics are reported at the policy's approve_below boundary rather than
+# at 0.5. Calibrated probabilities peak near 0.44 on this population, so a 0.5 cut classifies
+# every application negative and yields precision, recall, and tp of exactly zero. The
+# approve_below boundary is the decision the policy actually makes: approve versus refer.
+CLASSIFICATION_THRESHOLD_SOURCE = "policy_approve_below"
 BOOTSTRAP_SAMPLES = 1000
 BOOTSTRAP_CONFIDENCE_LEVEL = 0.95
 BOOTSTRAP_INTERVAL_METHOD = "percentile"
@@ -340,6 +344,7 @@ def _temporal_metrics(
     actions: np.ndarray,
     months: np.ndarray,
     policy: dict[str, object],
+    classification_threshold: float,
 ) -> pd.DataFrame:
     rows: list[dict[str, object]] = []
     for month in sorted(set(months.tolist())):
@@ -354,7 +359,7 @@ def _temporal_metrics(
             monthly_predictive = binary_metrics(
                 monthly_target,
                 monthly_probabilities,
-                threshold=CLASSIFICATION_THRESHOLD,
+                threshold=classification_threshold,
             )
             discrimination = {
                 "roc_auc": monthly_predictive["roc_auc"],
@@ -478,7 +483,8 @@ def main(
     transformed_feature_names = get_feature_names_out()
     model = _load_joblib(model_path, "frozen calibrated model artifact")
     probabilities = _validated_probabilities(model, transformed, len(test_frame))
-    predictions = (probabilities >= CLASSIFICATION_THRESHOLD).astype(int)
+    classification_threshold = float(policy["approve_below"])
+    predictions = (probabilities >= classification_threshold).astype(int)
     actions = assign_actions(
         probabilities,
         approve_below=float(policy["approve_below"]),
@@ -498,7 +504,7 @@ def main(
     predictive_metrics = binary_metrics(
         target,
         probabilities,
-        threshold=CLASSIFICATION_THRESHOLD,
+        threshold=classification_threshold,
     )
     confidence_intervals = {
         metric_name: bootstrap_metric(
@@ -518,6 +524,7 @@ def main(
         actions,
         months,
         policy,
+        classification_threshold,
     )
 
     final_metrics: dict[str, object] = {
@@ -528,7 +535,8 @@ def main(
             target, probabilities, bins=ECE_BINS
         ),
         "confidence_intervals": confidence_intervals,
-        "classification_threshold": CLASSIFICATION_THRESHOLD,
+        "classification_threshold": classification_threshold,
+        "classification_threshold_source": CLASSIFICATION_THRESHOLD_SOURCE,
         "bootstrap_methodology": {
             "samples": BOOTSTRAP_SAMPLES,
             "confidence_level": BOOTSTRAP_CONFIDENCE_LEVEL,

@@ -68,6 +68,7 @@ FINAL_METRICS_KEYS = {
     "expected_calibration_error",
     "confidence_intervals",
     "classification_threshold",
+    "classification_threshold_source",
     "bootstrap_methodology",
     "ece_methodology",
     "model_provenance",
@@ -525,7 +526,11 @@ def test_evaluate_uses_only_frozen_test_artifacts_and_writes_stable_schemas(
         "average_precision",
         "brier_score",
     }
-    assert final_metrics["classification_threshold"] == 0.5
+    # Threshold-dependent metrics must be reported at the policy's approve boundary. A fixed
+    # 0.5 cut sits above the calibrated probability range and drives precision and recall to
+    # zero for every application.
+    assert final_metrics["classification_threshold"] == float(policy["approve_below"])
+    assert final_metrics["classification_threshold_source"] == "policy_approve_below"
     assert final_metrics["test_samples"] == len(test_frame)
     assert final_metrics["bootstrap_methodology"] == {
         "samples": 1000,
@@ -661,6 +666,37 @@ def test_evaluate_requires_raw_fairness_grouping_columns(tmp_path: Path, column:
 
     with pytest.raises(ValueError, match=f"missing required columns: {column}"):
         evaluate_script.main(config_path=config_path, feature_dictionary_path=features_path)
+
+
+def test_evaluate_reports_threshold_metrics_at_the_policy_boundary(tmp_path: Path) -> None:
+    """Threshold metrics must describe a decision the policy actually makes.
+
+    A fixed 0.5 threshold sat above the calibrated probability range on the real population, so
+    precision, recall, and tp were all exactly zero next to a non-trivial ROC AUC. Binding the
+    reporting threshold to approve_below keeps the confusion matrix meaningful whatever the
+    probability scale turns out to be. This asserts the binding rather than a literal value,
+    because the synthetic fixture's probabilities do reach 0.5 and would hide the regression.
+    """
+    config_path, features_path, artifact_dir, _, _, policy = _write_test_environment(
+        tmp_path,
+        forbid_fit=False,
+    )
+    evaluate_script = _load_evaluate_script("evaluate_policy_boundary_threshold")
+    approve_below = float(policy["approve_below"])
+    assert approve_below != 0.5, "fixture must not make the policy boundary coincide with 0.5"
+
+    evaluate_script.main(config_path=config_path, feature_dictionary_path=features_path)
+
+    final_metrics = json.loads((artifact_dir / "final_test_metrics.json").read_text())
+    assert final_metrics["classification_threshold"] == approve_below
+    assert final_metrics["classification_threshold_source"] == "policy_approve_below"
+
+    scored = pd.read_parquet(artifact_dir / "scored_test.parquet")
+    probabilities = scored["default_probability"].to_numpy()
+    predictive = final_metrics["predictive_metrics"]
+    expected_positive = int((probabilities >= approve_below).sum())
+    assert predictive["tp"] + predictive["fp"] == expected_positive
+    assert scored["predicted_bad"].sum() == expected_positive
 
 
 def test_evaluate_rerun_is_deterministic(tmp_path: Path) -> None:

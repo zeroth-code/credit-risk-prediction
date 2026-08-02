@@ -529,6 +529,23 @@ def _metric_rows(metrics: dict[str, Any]) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _threshold_caption(metrics: dict[str, Any]) -> str:
+    """Say which cut precision, recall, and the confusion matrix describe.
+
+    Without this the table reads as if it used the conventional 0.5, which this model never
+    reaches.
+    """
+    threshold = metrics.get("classification_threshold")
+    if not isinstance(threshold, (int, float)) or isinstance(threshold, bool):
+        return "Precision, recall, and the confusion matrix use an unrecorded threshold."
+    return (
+        f"Precision, recall, and the confusion matrix are measured at the {float(threshold):.2f} "
+        "approve boundary, not at 0.5. Calibrated probabilities never reach 0.5, so that cut "
+        "would classify every application as good. ROC AUC, average precision, and Brier score "
+        "do not depend on a threshold."
+    )
+
+
 def _render_line_chart(frame: pd.DataFrame, *, y_title: str) -> bool:
     colors = ["#078A8C", "#D99A00", "#5F6B76", "#D64545"]
     figure = go.Figure()
@@ -708,6 +725,7 @@ def _render_model_performance(artifacts: demo.ReleaseArtifacts) -> None:
     st.caption(
         f"Evaluation sample: {artifacts.final_test_metrics.get('test_samples', 'Unavailable')}"
     )
+    st.caption(_threshold_caption(artifacts.final_test_metrics))
     st.markdown("#### Confusion matrix")
     st.dataframe(artifacts.confusion_matrix, hide_index=True, width="stretch")
     st.markdown("#### Temporal evidence")

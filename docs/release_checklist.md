@@ -94,6 +94,13 @@ the monthly test slices. At the conventional 0.5 threshold the model predicts no
 (TP 0, FP 0, FN 42,132, TN 240,894), which the README keeps prominent as evidence that accuracy
 is the wrong headline metric.
 
+Threshold-dependent metrics are published at the policy approve boundary of 0.05 rather than at
+0.5, because calibrated probabilities peak at 0.4355 and a 0.5 cut produces no positive
+predictions, making precision and recall vacuous. At 0.05 precision is 0.16043, recall 0.97686,
+and specificity 0.10587. `final_test_metrics.json` records the binding in
+`classification_threshold_source`, and `tests/test_evaluate.py` fails if the reporting
+threshold is decoupled from the policy.
+
 ## Cost per 1,000 applications and 27 sensitivity scenarios
 
 MET. `cost_sensitivity.csv` contains all 27 combinations of LGD {0.40, 0.60, 0.80}, margin

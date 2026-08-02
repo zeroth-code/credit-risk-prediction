@@ -7,7 +7,8 @@
     "resampling": "stratified_with_replacement",
     "samples": 1000
   },
-  "classification_threshold": 0.5,
+  "classification_threshold": 0.05,
+  "classification_threshold_source": "policy_approve_below",
   "confidence_intervals": {
     "average_precision": {
       "estimate": 0.24156811916805535,
@@ -51,16 +52,16 @@
   "predictive_metrics": {
     "average_precision": 0.24156811916805535,
     "brier_score": 0.1215392935956546,
-    "fn": 42132.0,
-    "fp": 0.0,
+    "fn": 975.0,
+    "fp": 215391.0,
     "ks": 0.23665400510602042,
     "log_loss": 0.3996374347967477,
-    "precision": 0.0,
-    "recall": 0.0,
+    "precision": 0.16042611908882548,
+    "recall": 0.9768584448874964,
     "roc_auc": 0.6627067682684525,
-    "specificity": 1.0,
-    "tn": 240894.0,
-    "tp": 0.0
+    "specificity": 0.10586814117412638,
+    "tn": 25503.0,
+    "tp": 41157.0
   },
   "prevalence": 0.14886264866125373,
   "test_samples": 283026

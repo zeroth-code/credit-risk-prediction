@@ -57,6 +57,15 @@ Natural full-underwriting LightGBM reaches validation average precision 0.226573
 feature set contains `int_rate`, `grade`, and `sub_grade`, which encode lender underwriting
 decisions and are excluded from the release challenger.
 
+An offline probe on the validation partition measured the headroom in the unused
+application-time bureau columns, which are neither post-origination nor part of LendingClub's
+own assessment. Adding roughly 35 of them lifts validation ROC AUC from 0.6575 to 0.6779,
+a gain of +0.0204 with a 95% bootstrap interval of [+0.0176, +0.0234]. Restricting training to
+2013, where those columns are 99% populated rather than 76% across 2011-2013, preserves the
+lift at +0.0197, so it is not an imputation artifact. This is documented headroom only; the
+released model does not use these features, and adopting them would require re-running
+calibration, policy selection, fairness, and explainability.
+
 ## Preprocessing
 
 The release preprocessor is fitted on train only:
@@ -138,6 +147,13 @@ therefore predicts no defaults at 0.5 despite an apparently high accuracy. Discr
 modest, and the model must be assessed as a probability-ranking system rather than a default
 0.5 classifier.
 
+Because calibrated probabilities peak at 0.4355, no application can be classified positive at
+0.5, and precision and recall there carry no information. Published threshold-dependent
+metrics use the policy approve boundary of 0.05 instead: precision 0.160426, recall 0.976858,
+specificity 0.105868, with TP = 41,157, FP = 215,391, FN = 975, and TN = 25,503. The
+`classification_threshold_source` field in `final_test_metrics.json` records this binding. The
+metrics above the table are threshold independent and unchanged.
+
 ## Cost Scenarios
 
 The base policy assumes LGD 60%, foregone margin 5%, and USD 30 per manual review. The
@@ -218,7 +234,8 @@ results without establishing a new reserved holdout.
 - Protected attributes are absent, so statutory fair-lending performance cannot be assessed.
 - The release offers no causal interpretation and no legal compliance conclusion.
 - Modest discrimination, zero default classifications at 0.5, and a 90.6% review rate are major
-  operational limitations.
+  operational limitations. Reported precision and recall use the 0.05 policy boundary, because
+  0.5 lies above the calibrated probability range and yields no positive predictions at all.
 - The cost result is a partial proxy: reviewed rows receive a terminal fee without modeled
   downstream decisions, credit loss, or foregone margin.
 - External validity beyond LendingClub's historical 2011-2015 population is unproven.

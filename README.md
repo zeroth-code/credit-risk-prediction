@@ -41,6 +41,14 @@ The out-of-time test set contains 42,132 bad loans among 283,026 loans, a preval
 detecting no defaults. That is exactly what the frozen calibrated model does at the
 conventional 0.5 classification threshold: TN 240,894, FN 42,132, FP 0, and TP 0.
 
+That 0.5 result is a statement about the threshold, not about the model. Calibrated
+probabilities on this population peak at 0.4355, so no application can ever be classified
+positive at 0.5, and precision and recall are undefined in substance even though scikit-learn
+reports them as zero. Published threshold-dependent metrics therefore use the policy's
+`approve_below` boundary of 0.05, which is the approve-versus-refer decision the system
+actually makes. Ranking and calibration metrics such as ROC AUC, average precision, Brier
+score, and ECE do not depend on any threshold and are unaffected.
+
 The project emphasizes ROC AUC, average precision, Brier score, log loss, calibration error,
 the Kolmogorov-Smirnov statistic, temporal slices, and scenario costs. The 0.5 result is kept
 prominent because it demonstrates why a probability model and an operating policy must not be
@@ -110,6 +118,28 @@ The weighted challenger LightGBM is selected by validation average precision amo
 challenger LightGBM strategies. Its positive-class weight is 6.9875. A 30-trial Optuna study
 selects 894 estimators, learning rate 0.0107234, 33 leaves, and the remaining regularization
 parameters recorded in `artifacts/release/validation_metrics.json`.
+
+### Where the discrimination ceiling comes from
+
+The released model reaches validation ROC AUC 0.6577. The evidence points at the feature set
+rather than the algorithm: LightGBM beats logistic regression by only about 0.013 on the same
+challenger columns, and the 30-trial Optuna study did not improve on the untuned weighted
+model. Adding LendingClub's own `grade`, `sub_grade`, and `int_rate` is worth roughly +0.014,
+and those columns are excluded deliberately, because they encode LendingClub's underwriting
+decision rather than the applicant.
+
+An offline probe measured what the unused application-time bureau columns are worth. Adding
+roughly 35 of them, none in `post_origination` and none from LendingClub's own assessment,
+moved validation ROC AUC from 0.6575 to 0.6779, a lift of +0.0204 with a 95% bootstrap
+interval of [+0.0176, +0.0234] over 300 resamples. Thirteen of the twenty highest-importance
+features were bureau columns. Because those columns are only 76% populated across the
+2011-2013 training window, the probe was repeated on 2013 alone, where coverage is 99%; the
+lift held at +0.0197, so it is not an artifact of differing imputation.
+
+This is a measured headroom estimate, not a released change. Adopting these features means
+handling the vintage coverage gap and re-running calibration, policy selection, fairness, and
+explainability end to end. The probe was run on the validation partition only; the test
+partition was not touched.
 
 ## Probability Calibration
 
@@ -194,6 +224,12 @@ bootstrap samples and random seed 42.
 
 ECE is the sample-weighted absolute gap between mean predicted PD and observed default rate
 across 10 equal-width probability bins; the final bin includes its upper endpoint.
+
+Threshold-dependent metrics are reported at the policy's approve boundary of 0.05, where
+precision is 0.160426, recall is 0.976858, and specificity is 0.105868 (TP 41,157, FP 215,391,
+FN 975, TN 25,503). This is a deliberately permissive operating point: the model refers almost
+every genuine default onward, at the cost of referring most good applications as well. The
+same threshold is used for the monthly temporal slices.
 
 Discrimination is modest. Monthly 2015 ROC AUC ranges from 0.6542 to 0.6742 and monthly ECE
 from 0.00235 to 0.01947; these are retrospective stability diagnostics, not evidence of live
@@ -303,7 +339,9 @@ rather than authenticate a publisher.
 ## Limitations and Responsible Use
 
 - The model has modest discrimination and is not suitable for autonomous credit decisions.
-- The conventional 0.5 classifier predicts no defaults on test data.
+- The conventional 0.5 classifier predicts no defaults on test data. Threshold-dependent
+  metrics are therefore reported at the policy approve boundary of 0.05, where recall is high
+  and precision is low by construction.
 - The cost policy sends 90.6% to manual review and declines none, so it is not operationally
   ready without capacity analysis and policy redesign.
 - Manual review is modeled as a terminal fee only. The partial cost proxy omits downstream
