@@ -115,6 +115,21 @@ increase on test is not proof of calibration drift. The later test ECE of 0.0111
 with calibration OOF ECE 0.000448, is consistent with degraded temporal calibration but is
 not definitive evidence by itself.
 
+### Output probability range
+
+The fitted sigmoid is `P = 1 / (1 + exp(-1.0195 * z + 1.8076))`, where `z` is the LightGBM
+decision function in log-odds units. The calibrator is unbounded and no code clamps the
+output, but `z` spans only -3.553 to +1.519 across the 283,026 test applications, so published
+probabilities span 0.4362% to 43.5550%. The positive tail is the binding constraint: reaching
+the 0.45 decline threshold requires `z >= 1.576`, which no real test application attains.
+
+This is a consequence of modest discrimination. At ROC AUC 0.662707 the features do not
+separate defaulters sharply enough to produce large positive margins, and sigmoid calibration
+anchors the output near the 14.8863% base rate rather than manufacturing unearned confidence.
+Test ECE 0.011108 indicates the compressed probabilities are accurate. Deliberately
+constructed extreme applications do leave the band, scoring 0.62% and 49.73%, so the range
+describes realistic applications rather than a hard bound.
+
 ## Selected Thresholds
 
 Thresholds are grid-searched on sigmoid calibration out-of-fold probabilities under the base

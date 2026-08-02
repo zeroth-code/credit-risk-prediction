@@ -157,6 +157,33 @@ sensitive, and the protocols differ, so the increase from calibration to test is
 calibration drift. The later test ECE of 0.011108, compared with calibration OOF ECE 0.000448,
 is consistent with degraded temporal calibration but is not definitive evidence by itself.
 
+### Why predicted probabilities stay in a narrow band
+
+Scored applications rarely leave roughly 5%-45%, and the released test set spans only 0.4362%
+to 43.5550%. Nothing clamps the output: `CreditPrediction` accepts any probability in [0, 1],
+and the fitted sigmoid is unbounded, mapping raw margins of -5 and +5 to 0.10% and 96.41%.
+
+The band comes from the base model's score distribution. The single fitted sigmoid is
+`P = 1 / (1 + exp(-1.0195 * z + 1.8076))`, where `z` is the LightGBM decision function in
+log-odds units. Across all 283,026 test applications `z` spans only -3.553 to +1.519, which
+maps to 0.44% and 43.56%. Reaching the 0.45 decline threshold would require `z >= 1.576`, and
+the most extreme real application observed falls short of that.
+
+The asymmetry is the point. `z` reaches far enough negative to express confident approval, but
+its positive tail stops early, so the model can say "clearly safe" and cannot say "clearly
+bad". With ROC AUC 0.663 the features do not separate defaulters sharply enough for the
+gradient-boosted trees to emit a large positive margin, and sigmoid calibration then anchors
+the output near the 14.9% base rate instead of manufacturing unearned confidence. Test ECE
+0.011108 indicates these compressed probabilities are accurate, so the narrow band is honest
+rather than a defect to be tuned away.
+
+Manually constructed extremes do exit the band, because the range is a property of realistic
+applications rather than a hard limit. An application with every field set to a coherent best
+case scores 0.62%, and a coherent worst case scores 49.73% and is declined. Individual inputs
+saturate well before that: sweeping `inq_last_6mths` past 6, `revol_util` past 120, or
+`loan_amnt` past 35,000 stops moving the prediction, because the training data contains few
+such applications and the trees hold no further split points there.
+
 ## Business Cost Policy
 
 The base scenario assumes 60% loss given default, 5% foregone margin on a declined good loan,
@@ -187,7 +214,8 @@ estimate, especially with 90.6% of applications ending at the modeled review fee
 Three reasons, and only the first is mechanical:
 
 1. Calibrated test probabilities span 0.0044 to 0.4355, so no application reaches the 0.45
-   decline threshold.
+   decline threshold. That ceiling is a property of the base model's score distribution rather
+   than an accident of this sample; see "Why predicted probabilities stay in a narrow band".
 2. The grid search selected 0.45 because cost falls as the threshold rises and then goes flat.
    Declining a good loan forfeits `loan_amnt * margin`, while review is a flat fee, so
    declining is only cheaper when `(1 - PD) * loan_amnt * 0.05 < 30`. At the highest observed
