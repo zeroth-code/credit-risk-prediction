@@ -16,6 +16,7 @@ from sklearn.metrics import brier_score_loss, confusion_matrix, log_loss  # noqa
 from credit_risk.calibration import expected_calibration_error  # noqa: E402
 from credit_risk.config import load_config  # noqa: E402
 from credit_risk.costs import assign_actions, policy_cost  # noqa: E402
+from credit_risk.explainability import generate_shap_explanations  # noqa: E402
 from credit_risk.features import build_feature_frame, load_feature_dictionary  # noqa: E402
 from credit_risk.metrics import binary_metrics, bootstrap_metric  # noqa: E402
 
@@ -405,14 +406,17 @@ def main(
 
     processed_dir = _project_path(config.processed_dir)
     artifact_dir = _project_path(config.artifact_dir)
+    figure_dir = _project_path(config.figure_dir)
     test_path = processed_dir / "test.parquet"
     preprocessor_path = artifact_dir / "preprocessor.joblib"
     model_path = artifact_dir / "calibrated_model.joblib"
+    explanation_model_path = artifact_dir / "uncalibrated_model.joblib"
     policy_path = artifact_dir / "policy.json"
     for path, description in (
         (test_path, "test partition"),
         (preprocessor_path, "frozen preprocessor artifact"),
         (model_path, "frozen calibrated model artifact"),
+        (explanation_model_path, "frozen uncalibrated explanation model artifact"),
         (policy_path, "frozen policy artifact"),
     ):
         _require_file(path, description)
@@ -451,6 +455,10 @@ def main(
     transformed_shape = getattr(transformed, "shape", None)
     if transformed_shape is None or transformed_shape[0] != len(test_frame):
         raise ValueError("preprocessor transform output rows must align with the test partition")
+    get_feature_names_out = getattr(preprocessor, "get_feature_names_out", None)
+    if not callable(get_feature_names_out):
+        raise ValueError("preprocessor artifact must provide get_feature_names_out")
+    transformed_feature_names = get_feature_names_out()
     model = _load_joblib(model_path, "frozen calibrated model artifact")
     probabilities = _validated_probabilities(model, transformed, len(test_frame))
     predictions = (probabilities >= CLASSIFICATION_THRESHOLD).astype(int)
@@ -556,6 +564,28 @@ def main(
     scored["action"] = actions
     if len(scored) != len(test_frame):
         raise RuntimeError("scored test rows are not aligned with the input test partition")
+
+    explanation_model = _load_joblib(
+        explanation_model_path,
+        "frozen uncalibrated explanation model artifact",
+    )
+    row_identifier_column = "id" if "id" in scored.columns else None
+    explanation_columns = ["action", "default_probability"]
+    if row_identifier_column is not None:
+        explanation_columns.append(row_identifier_column)
+    explanation_scored = scored.loc[:, explanation_columns].rename(
+        columns={"default_probability": "probability"}
+    )
+    generate_shap_explanations(
+        explanation_model,
+        transformed,
+        transformed_feature_names,
+        explanation_scored,
+        artifact_dir=artifact_dir,
+        figure_dir=figure_dir,
+        row_identifier_column=row_identifier_column,
+        model_artifact_name=explanation_model_path.name,
+    )
 
     _write_json(artifact_dir / "final_test_metrics.json", final_metrics)
     pd.DataFrame.from_records(

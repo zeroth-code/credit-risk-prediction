@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 import pytest
 import yaml
+from lightgbm import LGBMClassifier
 from sklearn.linear_model import LogisticRegression
 
 from credit_risk.calibration import expected_calibration_error as real_expected_calibration_error
@@ -26,6 +27,19 @@ OUTPUT_NAMES = {
     "policy_test_results.json",
     "temporal_metrics.csv",
     "scored_test.parquet",
+    "shap_importance.csv",
+    "shap_explanations.json",
+}
+SHAP_FIGURE_NAMES = {
+    "shap_beeswarm.png",
+    "shap_dependence_01.png",
+    "shap_dependence_02.png",
+    "shap_dependence_03.png",
+    "shap_dependence_04.png",
+    "shap_dependence_05.png",
+    "shap_waterfall_approve.png",
+    "shap_waterfall_manual_review.png",
+    "shap_waterfall_decline.png",
 }
 PREDICTIVE_METRIC_KEYS = {
     "roc_auc",
@@ -123,6 +137,9 @@ class FitForbiddenPreprocessor:
         assert frame.columns.tolist() == self.expected_columns
         return self.fitted.transform(frame)  # type: ignore[attr-defined,no-any-return]
 
+    def get_feature_names_out(self) -> np.ndarray:
+        return self.fitted.get_feature_names_out()  # type: ignore[attr-defined,no-any-return]
+
 
 class FitForbiddenModel:
     def __init__(self, fitted: object) -> None:
@@ -173,8 +190,26 @@ def _write_test_environment(
     config_dir.mkdir(parents=True)
 
     features_payload = {
-        "challenger": {"numeric": ["income"], "categorical": ["grade"]},
-        "full_underwriting": {"numeric": ["income"], "categorical": ["grade"]},
+        "challenger": {
+            "numeric": [
+                "income",
+                "debt_ratio",
+                "credit_history",
+                "open_accounts",
+                "utilization",
+            ],
+            "categorical": ["grade"],
+        },
+        "full_underwriting": {
+            "numeric": [
+                "income",
+                "debt_ratio",
+                "credit_history",
+                "open_accounts",
+                "utilization",
+            ],
+            "categorical": ["grade"],
+        },
         "post_origination": ["recoveries"],
     }
     features_path = config_dir / "features.yaml"
@@ -209,14 +244,33 @@ def _write_test_environment(
     training = pd.DataFrame(
         {
             "income": np.linspace(20_000.0, 120_000.0, 40),
+            "debt_ratio": np.linspace(0.1, 0.9, 40),
+            "credit_history": np.linspace(1.0, 20.0, 40),
+            "open_accounts": np.tile(np.arange(1.0, 6.0), 8),
+            "utilization": np.linspace(0.95, 0.05, 40),
             "grade": ["A", "B"] * 20,
         }
     )
     training_target = np.array([0, 1] * 20)
-    feature_columns = ["income", "grade"]
-    fitted_preprocessor = make_tree_preprocessor(["income"], ["grade"])
+    feature_columns = [
+        "income",
+        "debt_ratio",
+        "credit_history",
+        "open_accounts",
+        "utilization",
+        "grade",
+    ]
+    fitted_preprocessor = make_tree_preprocessor(feature_columns[:-1], ["grade"])
     training_matrix = fitted_preprocessor.fit_transform(training.loc[:, feature_columns])
     fitted_model = LogisticRegression(random_state=17).fit(training_matrix, training_target)
+    fitted_uncalibrated_model = LGBMClassifier(
+        n_estimators=8,
+        num_leaves=5,
+        min_child_samples=1,
+        random_state=17,
+        n_jobs=1,
+        verbosity=-1,
+    ).fit(training_matrix, training_target)
     preprocessor: object = fitted_preprocessor
     model: object = fitted_model
     if forbid_fit:
@@ -224,10 +278,37 @@ def _write_test_environment(
         model = FitForbiddenModel(fitted_model)
     joblib.dump(preprocessor, artifact_dir / "preprocessor.joblib")
     joblib.dump(model, artifact_dir / "calibrated_model.joblib")
+    joblib.dump(fitted_uncalibrated_model, artifact_dir / "uncalibrated_model.joblib")
+
+    test_frame = pd.DataFrame(
+        {
+            "id": [106, 101, 105, 102, 104, 103],
+            "income": [25_000.0, 35_000.0, 90_000.0, 45_000.0, 80_000.0, 70_000.0],
+            "debt_ratio": [0.15, 0.25, 0.8, 0.35, 0.7, 0.6],
+            "credit_history": [2.0, 4.0, 18.0, 7.0, 15.0, 12.0],
+            "open_accounts": [1.0, 2.0, 5.0, 3.0, 4.0, 3.0],
+            "utilization": [0.9, 0.75, 0.1, 0.6, 0.2, 0.4],
+            "grade": ["B", "A", "B", "A", "A", "B"],
+            "bad": [0, 0, 1, 0, 1, 0],
+            "issue_d": [
+                "2018-02-10",
+                "2018-01-05",
+                "2018-02-01",
+                "2018-01-20",
+                "2018-02-15",
+                "2018-02-28",
+            ],
+            "loan_amnt": [1000.0, 2000.0, 3000.0, 4000.0, 5000.0, 6000.0],
+        }
+    )
+    test_probabilities = fitted_model.predict_proba(
+        fitted_preprocessor.transform(test_frame.loc[:, feature_columns])
+    )[:, 1]
+    sorted_probabilities = np.sort(test_probabilities)
 
     policy_payload: dict[str, object] = {
-        "approve_below": 0.35,
-        "decline_at": 0.65,
+        "approve_below": float(np.mean(sorted_probabilities[1:3])),
+        "decline_at": float(np.mean(sorted_probabilities[3:5])),
         "lgd": 0.6,
         "margin": 0.05,
         "review_cost": 30.0,
@@ -248,23 +329,6 @@ def _write_test_environment(
     policy_path = artifact_dir / "policy.json"
     policy_path.write_text(json.dumps(policy_payload, indent=2), encoding="utf-8")
 
-    test_frame = pd.DataFrame(
-        {
-            "id": [106, 101, 105, 102, 104, 103],
-            "income": [25_000.0, 35_000.0, 90_000.0, 45_000.0, 80_000.0, 70_000.0],
-            "grade": ["B", "A", "B", "A", "A", "B"],
-            "bad": [0, 0, 1, 0, 1, 0],
-            "issue_d": [
-                "2018-02-10",
-                "2018-01-05",
-                "2018-02-01",
-                "2018-01-20",
-                "2018-02-15",
-                "2018-02-28",
-            ],
-            "loan_amnt": [1000.0, 2000.0, 3000.0, 4000.0, 5000.0, 6000.0],
-        }
-    )
     test_path = processed_dir / "test.parquet"
     test_frame.to_parquet(test_path, index=False)
     return config_path, features_path, artifact_dir, test_path, test_frame, policy_payload
@@ -280,6 +344,7 @@ def test_evaluate_uses_only_frozen_test_artifacts_and_writes_stable_schemas(
     input_paths = [
         artifact_dir / "preprocessor.joblib",
         artifact_dir / "calibrated_model.joblib",
+        artifact_dir / "uncalibrated_model.joblib",
         artifact_dir / "policy.json",
         test_path,
     ]
@@ -332,6 +397,11 @@ def test_evaluate_uses_only_frozen_test_artifacts_and_writes_stable_schemas(
     monkeypatch.setattr(evaluate_script, "bootstrap_metric", recording_bootstrap)
     monkeypatch.setattr(evaluate_script, "expected_calibration_error", recording_ece)
 
+    def forbidden_lightgbm_fit(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("evaluation must not fit the explanation model")
+
+    monkeypatch.setattr(LGBMClassifier, "fit", forbidden_lightgbm_fit)
+
     evaluate_script.main(config_path=config_path, feature_dictionary_path=features_path)
 
     assert read_paths == [test_path.resolve()]
@@ -343,6 +413,23 @@ def test_evaluate_uses_only_frozen_test_artifacts_and_writes_stable_schemas(
     assert ece_calls == [10, 10, 10]
     assert all(path.read_bytes() == original_bytes[path] for path in input_paths)
     assert OUTPUT_NAMES.issubset(path.name for path in artifact_dir.iterdir())
+    figure_dir = tmp_path / "reports/figures"
+    assert {path.name for path in figure_dir.iterdir()} == SHAP_FIGURE_NAMES
+
+    shap_importance = pd.read_csv(artifact_dir / "shap_importance.csv")
+    assert shap_importance.columns.tolist() == ["rank", "feature", "mean_abs_shap"]
+    assert len(shap_importance) == len(
+        joblib.load(artifact_dir / "preprocessor.joblib").get_feature_names_out()
+    )
+    shap_payload = json.loads((artifact_dir / "shap_explanations.json").read_text())
+    assert shap_payload["explanation_model"]["artifact"] == "uncalibrated_model.joblib"
+    assert shap_payload["explanation_model"]["output_space"] == "raw_model_output"
+    assert shap_payload["explanation_model"]["units"] == "log_odds"
+    assert set(shap_payload["local_explanations"]) == {
+        "approve",
+        "manual_review",
+        "decline",
+    }
 
     final_metrics = json.loads((artifact_dir / "final_test_metrics.json").read_text())
     assert set(final_metrics) == FINAL_METRICS_KEYS
