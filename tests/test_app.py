@@ -170,6 +170,16 @@ def _production_shap_explanations_payload() -> dict[str, object]:
                 )
             )
         },
+        "files": {
+            "importance": "shap_importance.csv",
+            "payload": "shap_explanations.json",
+            "beeswarm": "shap_beeswarm.png",
+            "dependence": [],
+            "waterfalls": {
+                action: f"shap_waterfall_{action}.png"
+                for action in ("approve", "manual_review", "decline")
+            },
+        },
     }
 
 
@@ -754,16 +764,99 @@ def test_load_release_artifacts_rejects_shap_contract_contradictions(
 def test_load_release_artifacts_accepts_unavailable_local_action(tmp_path: Path) -> None:
     payload = _production_shap_explanations_payload()
     local_explanations = payload["local_explanations"]
+    files = payload["files"]
     assert isinstance(local_explanations, dict)
+    assert isinstance(files, dict)
+    waterfalls = files["waterfalls"]
+    assert isinstance(waterfalls, dict)
     local_explanations["decline"] = None
+    del waterfalls["decline"]
     release_dir = _create_release(
         tmp_path,
+        policy_results_overrides={
+            "test_approval_rate": 0.55,
+            "test_review_rate": 0.45,
+            "test_decline_rate": 0.0,
+        },
         shap_explanations_overrides=payload,
     )
 
     artifacts = demo.load_release_artifacts(release_dir)
 
     assert artifacts.shap_explanations["local_explanations"]["decline"] is None
+
+
+def test_load_release_artifacts_rejects_unavailable_observed_action(tmp_path: Path) -> None:
+    payload = _production_shap_explanations_payload()
+    local_explanations = payload["local_explanations"]
+    files = payload["files"]
+    assert isinstance(local_explanations, dict)
+    assert isinstance(files, dict)
+    waterfalls = files["waterfalls"]
+    assert isinstance(waterfalls, dict)
+    local_explanations["decline"] = None
+    del waterfalls["decline"]
+    release_dir = _create_release(
+        tmp_path,
+        shap_explanations_overrides=payload,
+    )
+
+    with pytest.raises(demo.StartupError, match="decline.*test_decline_rate"):
+        demo.load_release_artifacts(release_dir)
+
+
+def test_load_release_artifacts_rejects_all_observed_actions_unavailable(
+    tmp_path: Path,
+) -> None:
+    payload = _production_shap_explanations_payload()
+    local_explanations = payload["local_explanations"]
+    files = payload["files"]
+    assert isinstance(local_explanations, dict)
+    assert isinstance(files, dict)
+    waterfalls = files["waterfalls"]
+    assert isinstance(waterfalls, dict)
+    for action in local_explanations:
+        local_explanations[action] = None
+    waterfalls.clear()
+    release_dir = _create_release(
+        tmp_path,
+        shap_explanations_overrides=payload,
+    )
+
+    with pytest.raises(demo.StartupError, match="approve.*test_approval_rate"):
+        demo.load_release_artifacts(release_dir)
+
+
+@pytest.mark.parametrize("contradiction", ["missing", "stale"])
+def test_load_release_artifacts_rejects_inconsistent_waterfall_mapping(
+    tmp_path: Path,
+    contradiction: str,
+) -> None:
+    payload = _production_shap_explanations_payload()
+    local_explanations = payload["local_explanations"]
+    files = payload["files"]
+    assert isinstance(local_explanations, dict)
+    assert isinstance(files, dict)
+    waterfalls = files["waterfalls"]
+    assert isinstance(waterfalls, dict)
+    policy_results_overrides: dict[str, object] | None = None
+    if contradiction == "missing":
+        del waterfalls["decline"]
+    else:
+        local_explanations["decline"] = None
+        policy_results_overrides = {
+            "test_approval_rate": 0.55,
+            "test_review_rate": 0.45,
+            "test_decline_rate": 0.0,
+        }
+    release_dir = _create_release(
+        tmp_path,
+        policy_results_overrides=policy_results_overrides,
+        shap_explanations_overrides=payload,
+    )
+
+    with pytest.raises(demo.StartupError, match="files.waterfalls"):
+        demo.load_release_artifacts(release_dir)
 
 
 @pytest.mark.parametrize("failure", ["missing", "tampered"])

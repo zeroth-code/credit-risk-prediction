@@ -390,7 +390,10 @@ def _shap_number(
     return parsed
 
 
-def _validate_shap_explanations(payload: dict[str, Any]) -> None:
+def _validate_shap_explanations(
+    payload: dict[str, Any],
+    policy_test_results: dict[str, Any],
+) -> None:
     _assert_artifact_value(
         payload,
         "schema_version",
@@ -434,6 +437,23 @@ def _validate_shap_explanations(payload: dict[str, Any]) -> None:
             "shap_explanations local_explanations must contain exactly "
             "approve, manual_review, and decline"
         )
+    files = _required_mapping(payload, "files", "shap_explanations")
+    waterfalls = _required_mapping(files, "waterfalls", "shap_explanations.files")
+    action_rate_fields = {
+        "approve": "test_approval_rate",
+        "manual_review": "test_review_rate",
+        "decline": "test_decline_rate",
+    }
+    action_rates = {
+        action: _shap_number(
+            policy_test_results,
+            field,
+            artifact="policy_test_results",
+            minimum=0.0,
+            maximum=1.0,
+        )
+        for action, field in action_rate_fields.items()
+    }
     required_local_fields = {
         "policy_action",
         "scored_index",
@@ -448,6 +468,12 @@ def _validate_shap_explanations(payload: dict[str, Any]) -> None:
         example = local_explanations[action]
         artifact = f"shap_explanations.local_explanations.{action}"
         if example is None:
+            rate_field = action_rate_fields[action]
+            if action_rates[action] > 0.0:
+                raise ValueError(
+                    f"{artifact} is unavailable but policy_test_results field "
+                    f"{rate_field} is positive"
+                )
             continue
         if not isinstance(example, dict):
             raise ValueError(f"{artifact} must be an object")
@@ -490,6 +516,16 @@ def _validate_shap_explanations(payload: dict[str, Any]) -> None:
             _shap_number(contribution, "shap_value", artifact=contribution_artifact)
         if len(feature_names) != len(set(feature_names)):
             raise ValueError(f"{artifact} top_contributions feature names must be unique")
+
+    expected_waterfalls = {
+        action: f"shap_waterfall_{action}.png"
+        for action, example in local_explanations.items()
+        if example is not None
+    }
+    if waterfalls != expected_waterfalls:
+        raise ValueError(
+            "shap_explanations files.waterfalls must exactly match available local explanations"
+        )
 
 
 def _load_verified_joblib(
@@ -552,7 +588,7 @@ def load_release_artifacts(release_dir: str | Path = DEFAULT_RELEASE_DIR) -> Rel
         final_test_metrics = _load_json_object(release_path / "final_test_metrics.json")
         policy_test_results = _load_json_object(release_path / "policy_test_results.json")
         shap_explanations = _load_json_object(release_path / "shap_explanations.json")
-        _validate_shap_explanations(shap_explanations)
+        _validate_shap_explanations(shap_explanations, policy_test_results)
         preprocessor = _load_verified_joblib(
             release_path,
             manifest,

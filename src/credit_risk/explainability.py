@@ -474,9 +474,7 @@ def generate_shap_explanations(
         }
         for rank, row in enumerate(ranked_features.itertuples(index=False), start=1)
     ]
-    waterfall_files = {
-        action: SHAP_WATERFALL_FILENAMES[action] for action in selected_indices
-    }
+    waterfall_files = {action: SHAP_WATERFALL_FILENAMES[action] for action in selected_indices}
     global_top_features = [
         {
             "rank": int(row.rank),
@@ -521,9 +519,7 @@ def generate_shap_explanations(
         figure_path / filename
         for filename in SHAP_DEPENDENCE_FILENAMES
         if figure_path / filename not in current_dependence_finals
-    ] + [
-        final_path for final_path in known_waterfall_finals if final_path not in waterfall_finals
-    ]
+    ] + [final_path for final_path in known_waterfall_finals if final_path not in waterfall_finals]
 
     try:
         importance.to_csv(
