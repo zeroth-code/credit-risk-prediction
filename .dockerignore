@@ -1,0 +1,16 @@
+# Keep the build context limited to the application and genuine release bundle.
+**
+!Dockerfile
+!.dockerignore
+!pyproject.toml
+!uv.lock
+!app/
+!app/*.py
+!configs/
+!configs/features.yaml
+!src/
+!src/credit_risk/
+!src/credit_risk/*.py
+!artifacts/
+!artifacts/release/
+!artifacts/release/**

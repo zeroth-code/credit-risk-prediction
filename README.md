@@ -255,18 +255,20 @@ Static checks use `uv run ruff check .`.
 
 ## Docker
 
-Docker packaging is pending Task 17. This commit does not contain a `Dockerfile`, so the
-following planned commands are not runnable yet. After Task 17 adds the packaging, the
-intended interface is:
+The image is built from the locked Python 3.12 runtime dependencies and does not install the
+development dependency group. Before building, the genuine frozen bundle must exist at
+`artifacts/release/`; Docker copies that bundle into the image and the application verifies it
+at startup.
 
 ```bash
-docker build -t credit-risk-prediction .
-docker run --rm -p 8501:8501 credit-risk-prediction
+docker build -t credit-risk-prediction:local .
+docker run --rm -p 8501:8501 credit-risk-prediction:local
 ```
 
-When packaging exists, the runtime must contain the frozen release bundle expected by the
-application. Do not load untrusted joblib files; Python pickle semantics can execute code
-during deserialization.
+The release bundle remains a local, untracked build input in Task 17, so a clean clone needs a
+genuine `artifacts/release/` supplied before the image can be built. Task 18 will decide how the
+public release bundle is distributed. Do not load untrusted joblib files; Python pickle
+semantics can execute code during deserialization.
 
 ## Limitations and Responsible Use
 
