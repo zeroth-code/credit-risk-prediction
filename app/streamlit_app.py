@@ -1,16 +1,11 @@
 """Read-only Streamlit demonstration for the frozen credit-risk release."""
 
 import html
-import json
-import math
-import os
 import sys
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import joblib
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -22,13 +17,9 @@ SRC_DIR = PROJECT_ROOT / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from credit_risk.artifacts import ReleaseManifest, validate_release_bundle  # noqa: E402
-from credit_risk.costs import assign_actions  # noqa: E402
-from credit_risk.features import feature_columns  # noqa: E402
-from credit_risk.schemas import CreditApplication, CreditPrediction  # noqa: E402
+from credit_risk import demo  # noqa: E402
+from credit_risk.schemas import CreditPrediction  # noqa: E402
 
-DEFAULT_RELEASE_DIR = PROJECT_ROOT / "artifacts/release"
-FEATURE_DICTIONARY_PATH = PROJECT_ROOT / "configs/features.yaml"
 PAGE_TITLE = "Credit Risk Decision Lab"
 PAGE_LAYOUT = "wide"
 DEMONSTRATION_WARNING = "Demonstration only - not a lending decision system. Inputs are not stored."
@@ -40,64 +31,36 @@ EVIDENCE_TABS = (
     "Fairness",
     "Limitations",
 )
-ALLOWED_POLICY_PROVENANCE = {
-    "selected_calibration_method": {"uncalibrated", "sigmoid", "isotonic"},
-    "probability_source": {"base_model_calibration_partition", "stratified_oof"},
-    "selection_partition": {"calibration"},
-    "threshold_selection_protocol": {"grid_search_on_calibration_evaluation_probabilities"},
-    "calibration_evaluation_protocol": {"stratified_oof", "base_model_holdout_only"},
-}
-FAIRNESS_FILES = {
-    "income": "fairness_income.csv",
-    "home_ownership": "fairness_home_ownership.csv",
-    "region": "fairness_region.csv",
-    "employment": "fairness_employment.csv",
-}
-TEST_SCORING_PROBABILITY_SOURCE = "frozen_calibrated_model"
-
-
-class StartupError(RuntimeError):
-    """Raised when the frozen release cannot be trusted or loaded."""
-
-
-class PredictionError(RuntimeError):
-    """Raised when a validated application cannot be scored safely."""
-
-
-@dataclass(frozen=True)
-class Policy:
-    approve_below: float
-    decline_at: float
-    lgd: float
-    margin: float
-    review_cost: float
-    currency: str
-    selected_calibration_method: str
-    probability_source: str
-    selection_partition: str
-    threshold_selection_protocol: str
-    calibration_evaluation_protocol: str
-
-
-@dataclass(frozen=True)
-class ReleaseArtifacts:
-    release_dir: Path
-    manifest: ReleaseManifest
-    preprocessor: object
-    model: object
-    policy: Policy
-    validation_metrics: dict[str, Any]
-    calibration_metrics: dict[str, Any]
-    calibration_curve: pd.DataFrame
-    cost_sensitivity: pd.DataFrame
-    final_test_metrics: dict[str, Any]
-    confusion_matrix: pd.DataFrame
-    policy_test_results: dict[str, Any]
-    temporal_metrics: pd.DataFrame
-    fairness_tables: dict[str, pd.DataFrame]
-    fairness_summary: dict[str, Any]
-    shap_importance: pd.DataFrame
-    shap_explanations: dict[str, Any]
+PURPOSE_OPTIONS = (
+    "debt_consolidation",
+    "credit_card",
+    "home_improvement",
+    "other",
+    "major_purchase",
+    "small_business",
+    "car",
+    "medical",
+    "moving",
+    "vacation",
+    "house",
+    "wedding",
+    "renewable_energy",
+    "educational",
+)
+EMPLOYMENT_OPTIONS = (
+    "10+ years",
+    "9 years",
+    "8 years",
+    "7 years",
+    "6 years",
+    "5 years",
+    "4 years",
+    "3 years",
+    "2 years",
+    "1 year",
+    "< 1 year",
+    "n/a",
+)
 
 
 @dataclass(frozen=True)
@@ -109,445 +72,11 @@ class ExplanationView:
     table: pd.DataFrame
 
 
-@dataclass(frozen=True)
-class ExplanationEvidence:
-    rows: list[tuple[str, float]]
-    source: str
-    context: str
-    value_column: str
-    number_format: str
-
-
-def _load_json_object(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as input_file:
-        payload = json.load(input_file)
-    if not isinstance(payload, dict):
-        raise ValueError(f"JSON artifact must contain an object: {path.name}")
-    return payload
-
-
-def _finite_policy_number(
-    payload: dict[str, Any],
-    field: str,
-    *,
-    minimum: float,
-    maximum: float | None = None,
-) -> float:
-    value = payload.get(field)
-    if isinstance(value, bool):
-        raise ValueError(f"policy field {field} must be numeric")
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"policy field {field} must be numeric") from exc
-    if not math.isfinite(parsed) or parsed < minimum:
-        raise ValueError(f"policy field {field} is outside its allowed range")
-    if maximum is not None and parsed > maximum:
-        raise ValueError(f"policy field {field} is outside its allowed range")
-    return parsed
-
-
-def _policy_string(payload: dict[str, Any], field: str) -> str:
-    value = payload.get(field)
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"policy field {field} must be a non-empty string")
-    return value.strip()
-
-
-def _parse_policy(payload: dict[str, Any]) -> Policy:
-    approve_below = _finite_policy_number(payload, "approve_below", minimum=0.0, maximum=1.0)
-    decline_at = _finite_policy_number(payload, "decline_at", minimum=0.0, maximum=1.0)
-    if approve_below >= decline_at:
-        raise ValueError("policy thresholds must satisfy approve_below < decline_at")
-    currency = _policy_string(payload, "currency")
-    if currency != "USD":
-        raise ValueError("policy currency must be USD")
-    provenance = {field: _policy_string(payload, field) for field in ALLOWED_POLICY_PROVENANCE}
-    for field, allowed_values in ALLOWED_POLICY_PROVENANCE.items():
-        if provenance[field] not in allowed_values:
-            allowed = ", ".join(sorted(allowed_values))
-            raise ValueError(f"policy field {field} must be one of: {allowed}")
-    method = provenance["selected_calibration_method"]
-    probability_source = provenance["probability_source"]
-    calibration_protocol = provenance["calibration_evaluation_protocol"]
-    if method in {"sigmoid", "isotonic"} and (
-        probability_source != "stratified_oof" or calibration_protocol != "stratified_oof"
-    ):
-        raise ValueError(
-            "policy calibrated methods require stratified_oof probability source and protocol"
-        )
-    if method == "uncalibrated" and probability_source != "base_model_calibration_partition":
-        raise ValueError(
-            "policy uncalibrated method requires base_model_calibration_partition probabilities"
-        )
-    return Policy(
-        approve_below=approve_below,
-        decline_at=decline_at,
-        lgd=_finite_policy_number(payload, "lgd", minimum=0.0, maximum=1.0),
-        margin=_finite_policy_number(payload, "margin", minimum=0.0, maximum=1.0),
-        review_cost=_finite_policy_number(payload, "review_cost", minimum=0.0),
-        currency=currency,
-        selected_calibration_method=provenance["selected_calibration_method"],
-        probability_source=provenance["probability_source"],
-        selection_partition=provenance["selection_partition"],
-        threshold_selection_protocol=provenance["threshold_selection_protocol"],
-        calibration_evaluation_protocol=provenance["calibration_evaluation_protocol"],
-    )
-
-
-def _validated_model_classes(model: object) -> tuple[np.ndarray, int]:
-    if not callable(getattr(model, "predict_proba", None)):
-        raise ValueError("calibrated model must provide callable predict_proba")
-    if not hasattr(model, "classes_"):
-        raise ValueError("calibrated model must provide classes_")
-    try:
-        classes = np.asarray(model.classes_)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("calibrated model classes_ must contain labels 0 and 1") from exc
-    if classes.ndim != 1 or len(classes) != 2:
-        raise ValueError("calibrated model classes_ must contain two binary labels")
-    if np.issubdtype(classes.dtype, np.bool_) or (
-        classes.dtype == object and any(isinstance(value, (bool, np.bool_)) for value in classes)
-    ):
-        raise ValueError("calibrated model classes_ must contain labels 0 and 1")
-    try:
-        has_missing = bool(pd.isna(classes).any())
-        is_binary = bool(np.isin(classes, [0, 1]).all())
-        unique_classes = np.unique(classes)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("calibrated model classes_ must contain labels 0 and 1") from exc
-    if has_missing or not is_binary or len(unique_classes) != 2:
-        raise ValueError("calibrated model classes_ must contain unique labels 0 and 1")
-    bad_indices = np.flatnonzero(classes == 1)
-    if len(bad_indices) != 1:
-        raise ValueError("calibrated model classes_ has an ambiguous bad class")
-    return classes, int(bad_indices[0])
-
-
-def _required_mapping(payload: dict[str, Any], field: str, artifact: str) -> dict[str, Any]:
-    value = payload.get(field)
-    if not isinstance(value, dict):
-        raise ValueError(f"{artifact} field {field} must be an object")
-    return value
-
-
-def _assert_artifact_value(
-    payload: dict[str, Any],
-    field: str,
-    expected: object,
-    *,
-    artifact: str,
-) -> None:
-    if field not in payload:
-        raise ValueError(f"{artifact} missing required field {field}")
-    actual = payload[field]
-    if isinstance(expected, float):
-        if isinstance(actual, bool):
-            matches = False
-        else:
-            try:
-                parsed = float(actual)
-            except (TypeError, ValueError):
-                matches = False
-            else:
-                matches = math.isfinite(parsed) and math.isclose(
-                    parsed, expected, rel_tol=1e-12, abs_tol=1e-12
-                )
-    else:
-        matches = actual == expected
-    if not matches:
-        raise ValueError(
-            f"{artifact} field {field} contradicts the frozen release: "
-            f"expected {expected!r}, found {actual!r}"
-        )
-
-
-def _validate_release_consistency(
-    manifest: ReleaseManifest,
-    policy: Policy,
-    validation_metrics: dict[str, Any],
-    calibration_metrics: dict[str, Any],
-    final_test_metrics: dict[str, Any],
-    policy_test_results: dict[str, Any],
-) -> None:
-    _assert_artifact_value(
-        validation_metrics,
-        "primary_feature_set",
-        manifest.feature_set,
-        artifact="validation_metrics",
-    )
-
-    calibration_expectations = {
-        "selected_method": policy.selected_calibration_method,
-        "evaluation_protocol": policy.calibration_evaluation_protocol,
-        "evaluation_partition": policy.selection_partition,
-    }
-    for field, expected in calibration_expectations.items():
-        _assert_artifact_value(
-            calibration_metrics,
-            field,
-            expected,
-            artifact="calibration_metrics",
-        )
-    calibration_artifact = _required_mapping(calibration_metrics, "artifact", "calibration_metrics")
-    _assert_artifact_value(
-        calibration_artifact,
-        "method",
-        policy.selected_calibration_method,
-        artifact="calibration_metrics.artifact",
-    )
-    methods = _required_mapping(calibration_metrics, "methods", "calibration_metrics")
-    selected_metrics = _required_mapping(
-        methods, policy.selected_calibration_method, "calibration_metrics.methods"
-    )
-    _assert_artifact_value(
-        selected_metrics,
-        "probability_source",
-        policy.probability_source,
-        artifact=f"calibration_metrics.methods.{policy.selected_calibration_method}",
-    )
-
-    policy_expectations = {
-        "approve_below": policy.approve_below,
-        "decline_at": policy.decline_at,
-        "lgd": policy.lgd,
-        "margin": policy.margin,
-        "review_cost": policy.review_cost,
-        "currency": policy.currency,
-        "selected_calibration_method": policy.selected_calibration_method,
-        "threshold_selection_probability_source": policy.probability_source,
-        "selection_partition": policy.selection_partition,
-        "threshold_selection_protocol": policy.threshold_selection_protocol,
-        "calibration_evaluation_protocol": policy.calibration_evaluation_protocol,
-        "test_scoring_probability_source": TEST_SCORING_PROBABILITY_SOURCE,
-    }
-    for field, expected in policy_expectations.items():
-        _assert_artifact_value(
-            policy_test_results,
-            field,
-            expected,
-            artifact="policy_test_results",
-        )
-
-    model_provenance = _required_mapping(
-        final_test_metrics, "model_provenance", "final_test_metrics"
-    )
-    model_expectations = {
-        "feature_set": manifest.feature_set,
-        "evaluation_partition": "test",
-        "preprocessor_artifact": manifest.preprocessor_file,
-        "model_artifact": manifest.model_file,
-        "test_scoring_probability_source": TEST_SCORING_PROBABILITY_SOURCE,
-    }
-    for field, expected in model_expectations.items():
-        _assert_artifact_value(
-            model_provenance,
-            field,
-            expected,
-            artifact="final_test_metrics.model_provenance",
-        )
-
-    policy_provenance = _required_mapping(
-        final_test_metrics, "policy_provenance", "final_test_metrics"
-    )
-    final_policy_expectations = {
-        "policy_artifact": manifest.policy_file,
-        "approve_below": policy.approve_below,
-        "decline_at": policy.decline_at,
-        "selected_calibration_method": policy.selected_calibration_method,
-        "threshold_selection_probability_source": policy.probability_source,
-        "calibration_evaluation_protocol": policy.calibration_evaluation_protocol,
-        "selection_partition": policy.selection_partition,
-        "threshold_selection_protocol": policy.threshold_selection_protocol,
-    }
-    for field, expected in final_policy_expectations.items():
-        _assert_artifact_value(
-            policy_provenance,
-            field,
-            expected,
-            artifact="final_test_metrics.policy_provenance",
-        )
-
-
-def load_release_artifacts(release_dir: str | Path = DEFAULT_RELEASE_DIR) -> ReleaseArtifacts:
-    release_path = Path(release_dir)
-    try:
-        manifest = validate_release_bundle(release_path)
-        if manifest.feature_set != "challenger":
-            raise ValueError("release feature_set must be challenger")
-
-        policy = _parse_policy(_load_json_object(release_path / manifest.policy_file))
-        validation_metrics = _load_json_object(release_path / "validation_metrics.json")
-        calibration_metrics = _load_json_object(release_path / "calibration_metrics.json")
-        final_test_metrics = _load_json_object(release_path / "final_test_metrics.json")
-        policy_test_results = _load_json_object(release_path / "policy_test_results.json")
-        preprocessor = joblib.load(release_path / manifest.preprocessor_file)
-        model = joblib.load(release_path / manifest.model_file)
-        if not callable(getattr(preprocessor, "transform", None)):
-            raise ValueError("frozen preprocessor must provide callable transform")
-        _validated_model_classes(model)
-        _validate_release_consistency(
-            manifest,
-            policy,
-            validation_metrics,
-            calibration_metrics,
-            final_test_metrics,
-            policy_test_results,
-        )
-        fairness_tables = {
-            name: pd.read_csv(release_path / filename) for name, filename in FAIRNESS_FILES.items()
-        }
-        return ReleaseArtifacts(
-            release_dir=release_path,
-            manifest=manifest,
-            preprocessor=preprocessor,
-            model=model,
-            policy=policy,
-            validation_metrics=validation_metrics,
-            calibration_metrics=calibration_metrics,
-            calibration_curve=pd.read_csv(release_path / "calibration_curve.csv"),
-            cost_sensitivity=pd.read_csv(release_path / "cost_sensitivity.csv"),
-            final_test_metrics=final_test_metrics,
-            confusion_matrix=pd.read_csv(release_path / "confusion_matrix.csv"),
-            policy_test_results=policy_test_results,
-            temporal_metrics=pd.read_csv(release_path / "temporal_metrics.csv"),
-            fairness_tables=fairness_tables,
-            fairness_summary=_load_json_object(release_path / "fairness_summary.json"),
-            shap_importance=pd.read_csv(release_path / "shap_importance.csv"),
-            shap_explanations=_load_json_object(release_path / "shap_explanations.json"),
-        )
-    except Exception as exc:
-        if isinstance(exc, StartupError):
-            raise
-        raise StartupError(f"release bundle is unavailable or inconsistent: {exc}") from exc
-
-
-def _bad_class_probability(model: object, matrix: object) -> float:
-    _, bad_index = _validated_model_classes(model)
-    predict_proba = model.predict_proba  # type: ignore[attr-defined]
-    try:
-        probabilities = np.asarray(predict_proba(matrix), dtype=float)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("calibrated model probabilities must be numeric") from exc
-    if probabilities.shape != (1, 2):
-        raise ValueError("calibrated model predict_proba must return shape (1, 2)")
-    if not np.isfinite(probabilities).all():
-        raise ValueError("calibrated model probabilities must be finite")
-    if not ((probabilities >= 0.0) & (probabilities <= 1.0)).all():
-        raise ValueError("calibrated model probabilities must be between 0 and 1")
-    if not np.allclose(probabilities.sum(axis=1), 1.0, rtol=1e-7, atol=1e-8):
-        raise ValueError("calibrated model probabilities must sum to 1")
-    return float(probabilities[0, bad_index])
-
-
-def _release_example_explanation(
-    artifacts: ReleaseArtifacts,
-    action: str,
-) -> ExplanationEvidence:
-    local_explanations = artifacts.shap_explanations.get("local_explanations")
-    if isinstance(local_explanations, dict):
-        example = local_explanations.get(action)
-        if isinstance(example, dict):
-            contributions = example.get("top_contributions")
-            if isinstance(contributions, list):
-                rows: list[tuple[str, float]] = []
-                for contribution in contributions:
-                    if not isinstance(contribution, dict):
-                        continue
-                    feature = contribution.get("feature")
-                    shap_value = contribution.get("shap_value")
-                    if (
-                        isinstance(feature, str)
-                        and feature.strip()
-                        and not isinstance(shap_value, bool)
-                    ):
-                        try:
-                            parsed_value = float(shap_value)
-                        except (TypeError, ValueError):
-                            continue
-                        if math.isfinite(parsed_value):
-                            rows.append((feature.strip(), parsed_value))
-                if rows:
-                    return ExplanationEvidence(
-                        rows=rows,
-                        source="local_action_example",
-                        context=(
-                            "Frozen release example for the assigned action; these directional "
-                            "SHAP values were not generated for the entered application."
-                        ),
-                        value_column="Directional association (SHAP value)",
-                        number_format="%+.4f",
-                    )
-
-    rows = []
-    required_columns = {"feature", "mean_abs_shap"}
-    if required_columns.issubset(artifacts.shap_importance.columns):
-        for row in artifacts.shap_importance.loc[:, ["feature", "mean_abs_shap"]].itertuples(
-            index=False
-        ):
-            if isinstance(row.feature, str) and row.feature.strip():
-                value = float(row.mean_abs_shap)
-                if math.isfinite(value) and value >= 0.0:
-                    rows.append((row.feature.strip(), value))
-    if not rows:
-        raise ValueError("release explanation payload contains no usable associations")
-    return ExplanationEvidence(
-        rows=rows[:5],
-        source="global_mean_absolute_importance",
-        context=(
-            "Global unsigned mean absolute SHAP association/importance; this is not a local "
-            "explanation, is not directional, and is not action-specific."
-        ),
-        value_column="Mean absolute association (unsigned)",
-        number_format="%.4f",
-    )
-
-
-def predict_application(
-    values: Mapping[str, object],
-    artifacts: ReleaseArtifacts,
-) -> CreditPrediction:
-    application = CreditApplication.model_validate(dict(values))
-    try:
-        numeric_columns, categorical_columns = feature_columns(
-            artifacts.manifest.feature_set,
-            path=FEATURE_DICTIONARY_PATH,
-        )
-        selected_columns = [*numeric_columns, *categorical_columns]
-        frame = pd.DataFrame([application.model_dump()], columns=selected_columns)
-        transform = getattr(artifacts.preprocessor, "transform", None)
-        if not callable(transform):
-            raise ValueError("frozen preprocessor must provide transform")
-        transformed = transform(frame)
-        transformed_shape = getattr(transformed, "shape", None)
-        if transformed_shape is None or transformed_shape[0] != 1:
-            raise ValueError("preprocessor transform must return one scored row")
-        probability = _bad_class_probability(artifacts.model, transformed)
-        actions = assign_actions(
-            [probability],
-            approve_below=artifacts.policy.approve_below,
-            decline_at=artifacts.policy.decline_at,
-        )
-        if len(actions) != 1:
-            raise ValueError("policy assignment must return exactly one action")
-        action = str(actions[0])
-        explanation = _release_example_explanation(artifacts, action)
-        return CreditPrediction(
-            default_probability=float(probability),
-            action=action,
-            explanation=[(feature, float(value)) for feature, value in explanation.rows],
-        )
-    except Exception as exc:
-        if isinstance(exc, PredictionError):
-            raise
-        raise PredictionError(f"credit prediction failed: {exc}") from exc
-
-
 def explanation_view(
     prediction: CreditPrediction,
-    artifacts: ReleaseArtifacts,
+    artifacts: demo.ReleaseArtifacts,
 ) -> ExplanationView:
-    evidence = _release_example_explanation(artifacts, prediction.action)
+    evidence = demo.explanation_evidence(artifacts, prediction.action)
     return ExplanationView(
         label=ASSOCIATION_LABEL,
         source=evidence.source,
@@ -561,13 +90,20 @@ def explanation_view(
 
 
 @st.cache_resource(show_spinner=False)
-def cached_release_artifacts(release_dir: str) -> ReleaseArtifacts:
-    return load_release_artifacts(Path(release_dir))
-
-
-def _release_directory() -> Path:
-    override = os.environ.get("CREDIT_RISK_RELEASE_DIR")
-    return Path(override) if override else DEFAULT_RELEASE_DIR
+def cached_release_artifacts(
+    release_dir: str,
+    release_version: str,
+    manifest_digest: str,
+) -> demo.ReleaseArtifacts:
+    expected_identity = (release_dir, release_version, manifest_digest)
+    if demo.release_cache_identity(release_dir) != expected_identity:
+        raise demo.StartupError("release manifest changed before artifact loading")
+    artifacts = demo.load_release_artifacts(Path(release_dir))
+    if artifacts.manifest.version != release_version:
+        raise demo.StartupError("loaded release version does not match the cache identity")
+    if demo.release_cache_identity(release_dir) != expected_identity:
+        raise demo.StartupError("release manifest changed while artifacts were loading")
+    return artifacts
 
 
 def _inject_css() -> None:
@@ -772,6 +308,7 @@ def _inject_css() -> None:
 
 
 def _render_form() -> tuple[bool, dict[str, object]]:
+    defaults = demo.SYNTHETIC_APPLICATION_VALUES
     st.markdown(
         "<div class='workflow-heading'><h2>Application inputs</h2></div>", unsafe_allow_html=True
     )
@@ -779,60 +316,90 @@ def _render_form() -> tuple[bool, dict[str, object]]:
         left, right = st.columns(2, gap="medium")
         with left:
             loan_amnt = st.number_input(
-                "Loan amount (USD)", min_value=1.0, max_value=100_000.0, value=25_000.0
+                "Loan amount (USD)",
+                min_value=1.0,
+                max_value=100_000.0,
+                value=float(defaults["loan_amnt"]),
             )
-            annual_inc = st.number_input("Annual income (USD)", min_value=1.0, value=85_000.0)
+            annual_inc = st.number_input(
+                "Annual income (USD)", min_value=1.0, value=float(defaults["annual_inc"])
+            )
             dti = st.number_input(
-                "Debt-to-income ratio (%)", min_value=0.0, max_value=100.0, value=28.0
+                "Debt-to-income ratio (%)",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(defaults["dti"]),
             )
             fico_range_low = st.number_input(
-                "FICO range low", min_value=300.0, max_value=850.0, value=680.0
+                "FICO range low",
+                min_value=300.0,
+                max_value=850.0,
+                value=float(defaults["fico_range_low"]),
             )
             fico_range_high = st.number_input(
-                "FICO range high", min_value=300.0, max_value=850.0, value=720.0
+                "FICO range high",
+                min_value=300.0,
+                max_value=850.0,
+                value=float(defaults["fico_range_high"]),
             )
             delinq_2yrs = st.number_input(
-                "Delinquencies (2 years)", min_value=0.0, value=1.0, step=1.0
+                "Delinquencies (2 years)",
+                min_value=0.0,
+                value=float(defaults["delinq_2yrs"]),
+                step=1.0,
             )
             inq_last_6mths = st.number_input(
-                "Inquiries (6 months)", min_value=0.0, value=2.0, step=1.0
+                "Inquiries (6 months)",
+                min_value=0.0,
+                value=float(defaults["inq_last_6mths"]),
+                step=1.0,
             )
-            open_acc = st.number_input("Open accounts", min_value=0.0, value=8.0, step=1.0)
+            open_acc = st.number_input(
+                "Open accounts", min_value=0.0, value=float(defaults["open_acc"]), step=1.0
+            )
         with right:
-            pub_rec = st.number_input("Public records", min_value=0.0, value=0.0, step=1.0)
-            revol_bal = st.number_input("Revolving balance (USD)", min_value=0.0, value=6_200.0)
-            revol_util = st.number_input(
-                "Revolving utilization (%)", min_value=0.0, max_value=200.0, value=32.0
+            pub_rec = st.number_input(
+                "Public records", min_value=0.0, value=float(defaults["pub_rec"]), step=1.0
             )
-            total_acc = st.number_input("Total accounts", min_value=0.0, value=18.0, step=1.0)
+            revol_bal = st.number_input(
+                "Revolving balance (USD)", min_value=0.0, value=float(defaults["revol_bal"])
+            )
+            revol_util = st.number_input(
+                "Revolving utilization (%)",
+                min_value=0.0,
+                max_value=200.0,
+                value=float(defaults["revol_util"]),
+            )
+            total_acc = st.number_input(
+                "Total accounts", min_value=0.0, value=float(defaults["total_acc"]), step=1.0
+            )
             purpose = st.selectbox(
                 "Purpose",
-                [
-                    "debt_consolidation",
-                    "credit_card",
-                    "home_improvement",
-                    "major_purchase",
-                    "medical",
-                    "small_business",
-                    "other",
-                ],
+                PURPOSE_OPTIONS,
+                index=PURPOSE_OPTIONS.index(str(defaults["purpose"])),
             )
-            home_ownership = st.selectbox("Home ownership", ["MORTGAGE", "RENT", "OWN", "OTHER"])
+            home_options = ["MORTGAGE", "RENT", "OWN", "OTHER"]
+            home_ownership = st.selectbox(
+                "Home ownership",
+                home_options,
+                index=home_options.index(str(defaults["home_ownership"])),
+            )
+            verification_options = ["Verified", "Source Verified", "Not Verified"]
             verification_status = st.selectbox(
-                "Verification status", ["Verified", "Source Verified", "Not Verified"]
+                "Verification status",
+                verification_options,
+                index=verification_options.index(str(defaults["verification_status"])),
             )
             emp_length = st.selectbox(
                 "Employment length",
-                [
-                    "5+ years",
-                    "10+ years",
-                    "2 years",
-                    "1 year",
-                    "< 1 year",
-                    "n/a",
-                ],
+                EMPLOYMENT_OPTIONS,
+                index=EMPLOYMENT_OPTIONS.index(str(defaults["emp_length"])),
             )
-            addr_state = st.text_input("State (two-letter code)", value="TX", max_chars=2)
+            addr_state = st.text_input(
+                "State (two-letter code)",
+                value=str(defaults["addr_state"]),
+                max_chars=2,
+            )
         submitted = st.form_submit_button("Run assessment", width="stretch")
     return submitted, {
         "loan_amnt": float(loan_amnt),
@@ -865,7 +432,7 @@ def _display_action(action: str) -> str:
 
 def _render_result(
     prediction: CreditPrediction | None,
-    artifacts: ReleaseArtifacts,
+    artifacts: demo.ReleaseArtifacts,
     error_message: str | None,
 ) -> None:
     st.markdown(
@@ -1067,7 +634,75 @@ def _render_calibration_chart(curve: pd.DataFrame) -> bool:
     return True
 
 
-def _render_model_performance(artifacts: ReleaseArtifacts) -> None:
+def _render_business_cost_sensitivity_chart(sensitivity: pd.DataFrame) -> bool:
+    required = {
+        "lgd",
+        "margin",
+        "review_cost",
+        "optimal_cost_per_1000_applications",
+    }
+    if not required.issubset(sensitivity.columns):
+        return False
+
+    scenarios = sensitivity.loc[:, sorted(required)].apply(pd.to_numeric, errors="coerce")
+    finite = np.isfinite(scenarios.loc[:, list(required)]).all(axis=1)
+    scenarios = scenarios.loc[finite]
+    if scenarios.empty:
+        return False
+
+    colors = [
+        "#078A8C",
+        "#D99A00",
+        "#D64545",
+        "#5F6B76",
+        "#3877B2",
+        "#7A5C99",
+        "#3E8E5B",
+        "#B56B2D",
+        "#A64D79",
+    ]
+    figure = go.Figure()
+    grouped = scenarios.groupby(["lgd", "margin"], sort=True)
+    for index, ((lgd, margin), rows) in enumerate(grouped):
+        rows = rows.sort_values("review_cost", kind="stable")
+        figure.add_trace(
+            go.Scatter(
+                x=rows["review_cost"],
+                y=rows["optimal_cost_per_1000_applications"],
+                mode="lines+markers",
+                name=f"LGD {lgd:.0%} / Margin {margin:.0%}",
+                line={"color": colors[index % len(colors)], "width": 2},
+                marker={"size": 7},
+            )
+        )
+    figure.update_layout(
+        height=360,
+        margin={"l": 58, "r": 20, "t": 22, "b": 52},
+        paper_bgcolor="#FFFFFF",
+        plot_bgcolor="#FFFFFF",
+        font={"color": "#17202A", "size": 12},
+        legend={"orientation": "h", "y": 1.22, "x": 0},
+        xaxis={
+            "title": "Manual review cost",
+            "gridcolor": "#E8EDF1",
+            "zeroline": False,
+        },
+        yaxis={
+            "title": "Cost per 1,000 applications",
+            "gridcolor": "#E8EDF1",
+            "zeroline": False,
+        },
+        hovermode="closest",
+    )
+    st.plotly_chart(
+        figure,
+        width="stretch",
+        config={"displayModeBar": False, "responsive": True},
+    )
+    return True
+
+
+def _render_model_performance(artifacts: demo.ReleaseArtifacts) -> None:
     st.subheader("Final out-of-time performance")
     st.dataframe(_metric_rows(artifacts.final_test_metrics), hide_index=True, width="stretch")
     st.caption(
@@ -1094,7 +729,7 @@ def _render_model_performance(artifacts: ReleaseArtifacts) -> None:
         st.json(artifacts.validation_metrics, expanded=False)
 
 
-def _render_calibration(artifacts: ReleaseArtifacts) -> None:
+def _render_calibration(artifacts: demo.ReleaseArtifacts) -> None:
     st.subheader("Calibration evidence")
     selected = artifacts.calibration_metrics.get("selected_method", "Unavailable")
     ece = artifacts.final_test_metrics.get("expected_calibration_error")
@@ -1112,7 +747,7 @@ def _render_calibration(artifacts: ReleaseArtifacts) -> None:
         st.json(artifacts.calibration_metrics, expanded=False)
 
 
-def _render_business_cost(artifacts: ReleaseArtifacts) -> None:
+def _render_business_cost(artifacts: demo.ReleaseArtifacts) -> None:
     st.subheader("Frozen policy and cost sensitivity")
     policy_results = artifacts.policy_test_results
     rows = [
@@ -1137,22 +772,12 @@ def _render_business_cost(artifacts: ReleaseArtifacts) -> None:
         width="stretch",
     )
     sensitivity = artifacts.cost_sensitivity.copy()
-    if (
-        "review_cost" in sensitivity.columns
-        and "optimal_cost_per_1000_applications" in sensitivity.columns
-    ):
-        chart = (
-            sensitivity.loc[:, ["review_cost", "optimal_cost_per_1000_applications"]]
-            .apply(pd.to_numeric, errors="coerce")
-            .set_index("review_cost")
-        )
-        _render_line_chart(chart, y_title="Cost per 1,000 applications")
-    else:
+    if not _render_business_cost_sensitivity_chart(sensitivity):
         st.info("Cost sensitivity chart values are unavailable in this release.")
     st.dataframe(sensitivity, hide_index=True, width="stretch")
 
 
-def _render_fairness(artifacts: ReleaseArtifacts) -> None:
+def _render_fairness(artifacts: demo.ReleaseArtifacts) -> None:
     st.subheader("Fairness diagnostics")
     limitations = artifacts.fairness_summary.get("limitations")
     if isinstance(limitations, str) and limitations.strip():
@@ -1174,7 +799,7 @@ def _render_fairness(artifacts: ReleaseArtifacts) -> None:
         st.json(artifacts.fairness_summary, expanded=False)
 
 
-def _render_limitations(artifacts: ReleaseArtifacts) -> None:
+def _render_limitations(artifacts: demo.ReleaseArtifacts) -> None:
     st.subheader("Known limitations")
     st.markdown(
         "- Historical LendingClub data reflects prior underwriting and selection, not the "
@@ -1183,6 +808,8 @@ def _render_limitations(artifacts: ReleaseArtifacts) -> None:
         "effects.\n"
         "- The release does not establish statutory fair-lending compliance or production "
         "monitoring.\n"
+        "- Joblib uses Python pickle semantics. Load only releases from a trusted source; "
+        "manifest hashes do not authenticate an untrusted bundle.\n"
         "- Operational use would require independent validation, governance, human "
         "oversight, and ongoing drift review."
     )
@@ -1196,7 +823,7 @@ def _render_limitations(artifacts: ReleaseArtifacts) -> None:
         st.dataframe(artifacts.shap_importance, hide_index=True, width="stretch")
 
 
-def _render_evidence(artifacts: ReleaseArtifacts) -> None:
+def _render_evidence(artifacts: demo.ReleaseArtifacts) -> None:
     tabs = st.tabs(EVIDENCE_TABS)
     with tabs[0]:
         _render_model_performance(artifacts)
@@ -1214,8 +841,9 @@ def main() -> None:
     st.set_page_config(page_title=PAGE_TITLE, layout=PAGE_LAYOUT, initial_sidebar_state="collapsed")
     _inject_css()
     try:
-        artifacts = cached_release_artifacts(str(_release_directory()))
-    except StartupError as exc:
+        release_identity = demo.release_cache_identity(demo.release_directory())
+        artifacts = cached_release_artifacts(*release_identity)
+    except demo.StartupError as exc:
         st.error(f"Cannot start the demonstration: {exc}")
         st.stop()
 
@@ -1238,12 +866,12 @@ def main() -> None:
     error_message: str | None = None
     if submitted:
         try:
-            prediction = predict_application(values, artifacts)
+            prediction = demo.predict_application(values, artifacts)
         except ValidationError as exc:
             first_error = exc.errors(include_url=False)[0]
             field = ".".join(str(item) for item in first_error["loc"])
             error_message = f"Invalid {field}: {first_error['msg']}"
-        except PredictionError:
+        except demo.PredictionError:
             error_message = "Assessment could not be completed from the validated release."
 
     with result_column:

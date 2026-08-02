@@ -4,6 +4,7 @@ import inspect
 import json
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import ModuleType
 
@@ -12,13 +13,17 @@ import numpy as np
 import pandas as pd
 import pytest
 from pydantic import ValidationError
+from sklearn.linear_model import LogisticRegression
 from streamlit.testing.v1 import AppTest
 
+from credit_risk import demo
 from credit_risk.artifacts import create_release_bundle
+from credit_risk.features import feature_columns, make_tree_preprocessor
 from credit_risk.schemas import CreditPrediction
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 APP_PATH = PROJECT_ROOT / "app/streamlit_app.py"
+DEMO_PATH = PROJECT_ROOT / "src/credit_risk/demo.py"
 
 
 def _load_app_module() -> ModuleType:
@@ -36,15 +41,25 @@ streamlit_app = _load_app_module()
 
 
 class RecordingPreprocessor:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        transformed: object | None = None,
+        feature_names: list[str] | None = None,
+    ) -> None:
         self.transform_calls: list[pd.DataFrame] = []
+        self.transformed = (
+            np.array([[1.0, 2.0]]) if transformed is None else np.asarray(transformed)
+        )
+        if feature_names is not None:
+            self.feature_names_in_ = np.asarray(feature_names, dtype=object)
 
     def fit(self, *_args: object, **_kwargs: object) -> None:
         raise AssertionError("the application must never fit the frozen preprocessor")
 
     def transform(self, frame: pd.DataFrame) -> np.ndarray:
         self.transform_calls.append(frame.copy(deep=True))
-        return np.array([[1.0, 2.0]])
+        return self.transformed.copy()
 
 
 class FixedProbabilityModel:
@@ -53,11 +68,16 @@ class FixedProbabilityModel:
         *,
         classes: object = (0, 1),
         probabilities: tuple[float, float] = (0.8, 0.2),
+        n_features: int | None = None,
     ) -> None:
         self.classes_ = np.asarray(classes)
         self.probabilities = np.asarray([probabilities], dtype=float)
+        self.predict_calls: list[object] = []
+        if n_features is not None:
+            self.n_features_in_ = n_features
 
-    def predict_proba(self, _matrix: object) -> np.ndarray:
+    def predict_proba(self, matrix: object) -> np.ndarray:
+        self.predict_calls.append(matrix)
         return self.probabilities.copy()
 
 
@@ -76,6 +96,81 @@ class MissingTransformPreprocessor:
 
 def _write_json(path: Path, payload: object) -> None:
     path.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+
+
+def _production_cost_sensitivity_frame() -> pd.DataFrame:
+    rows = []
+    for lgd in (0.4, 0.6, 0.8):
+        for margin in (0.03, 0.05, 0.07):
+            for review_cost in (10.0, 30.0, 50.0):
+                base_cost = 500.0 + lgd * 1_000.0 + margin * 2_000.0
+                rows.append(
+                    {
+                        "lgd": lgd,
+                        "margin": margin,
+                        "review_cost": review_cost,
+                        "is_base_scenario": lgd == 0.6 and margin == 0.05 and review_cost == 30.0,
+                        "optimal_approve_below": 0.25,
+                        "optimal_decline_at": 0.65,
+                        "optimal_cost": base_cost + review_cost,
+                        "optimal_cost_per_1000_applications": base_cost + review_cost,
+                        "optimal_approval_rate": 0.5,
+                        "optimal_review_rate": 0.3,
+                        "optimal_decline_rate": 0.2,
+                        "base_approve_below": 0.25,
+                        "base_decline_at": 0.65,
+                        "frozen_base_cost": base_cost + review_cost * 1.5,
+                        "frozen_base_cost_per_1000_applications": base_cost + review_cost * 1.5,
+                        "frozen_base_approval_rate": 0.5,
+                        "frozen_base_review_rate": 0.3,
+                        "frozen_base_decline_rate": 0.2,
+                    }
+                )
+    return pd.DataFrame.from_records(rows)
+
+
+def _production_shap_explanations_payload() -> dict[str, object]:
+    return {
+        "schema_version": "1.0",
+        "explanation_model": {
+            "artifact": "uncalibrated_model.joblib",
+            "source": "frozen_uncalibrated_lightgbm",
+            "objective": "binary",
+            "sigmoid": 1.0,
+            "output_space": "raw_model_output",
+            "units": "log_odds",
+            "calibrated_probability_source": "frozen_calibrated_model",
+            "calibration_note": (
+                "SHAP values explain the frozen base LightGBM score, not the "
+                "post-calibration probability."
+            ),
+        },
+        "local_explanations": {
+            action: {
+                "policy_action": action,
+                "scored_index": index,
+                "row_identifier": None,
+                "calibrated_probability": probability,
+                "base_value": 0.1,
+                "base_model_raw_output": 0.1 + contribution,
+                "top_contributions": [
+                    {
+                        "feature": "numeric__dti",
+                        "feature_value": 28.0,
+                        "shap_value": contribution,
+                    }
+                ],
+                "waterfall": f"shap_waterfall_{action}.png",
+            }
+            for index, (action, probability, contribution) in enumerate(
+                (
+                    ("approve", 0.12, -0.4),
+                    ("manual_review", 0.45, 0.2),
+                    ("decline", 0.78, 0.6),
+                )
+            )
+        },
+    }
 
 
 def _create_release(
@@ -183,32 +278,7 @@ def _create_release(
             "attributes": {},
         },
     )
-    shap_explanations = {
-        "schema_version": "1.0",
-        "explanation_model": {
-            "output_space": "raw_model_output",
-            "units": "log_odds",
-            "calibration_note": "Example explanations use the frozen base model.",
-        },
-        "local_explanations": {
-            action: {
-                "policy_action": action,
-                "calibrated_probability": probability,
-                "top_contributions": [
-                    {
-                        "feature": "numeric__dti",
-                        "feature_value": 28.0,
-                        "shap_value": contribution,
-                    }
-                ],
-            }
-            for action, probability, contribution in (
-                ("approve", 0.12, -0.4),
-                ("manual_review", 0.45, 0.2),
-                ("decline", 0.78, 0.6),
-            )
-        },
-    }
+    shap_explanations = _production_shap_explanations_payload()
     shap_explanations.update(shap_explanations_overrides or {})
     _write_json(source_dir / "shap_explanations.json", shap_explanations)
     (source_dir / "calibration_curve.csv").write_text(
@@ -216,10 +286,8 @@ def _create_release(
         "sigmoid,0,0.10,0.12,50\n",
         encoding="utf-8",
     )
-    (source_dir / "cost_sensitivity.csv").write_text(
-        "lgd,margin,review_cost,optimal_cost_per_1000_applications,is_base_scenario\n"
-        "0.6,0.05,30.0,1500.0,True\n",
-        encoding="utf-8",
+    _production_cost_sensitivity_frame().to_csv(
+        source_dir / "cost_sensitivity.csv", index=False, encoding="utf-8"
     )
     (source_dir / "confusion_matrix.csv").write_text(
         "actual_label,predicted_label,count\n0,0,70\n0,1,10\n1,0,20\n1,1,20\n",
@@ -273,7 +341,7 @@ def _application_payload() -> dict[str, object]:
         "purpose": " debt_consolidation ",
         "home_ownership": " MORTGAGE ",
         "verification_status": " Verified ",
-        "emp_length": " 5+ years ",
+        "emp_length": " 5 years ",
         "addr_state": " tx ",
     }
 
@@ -334,9 +402,9 @@ def test_css_contract_clears_header_and_keeps_desktop_workflow_compact() -> None
 def test_load_release_artifacts_validates_and_loads_typed_bundle(tmp_path: Path) -> None:
     release_dir = _create_release(tmp_path)
 
-    artifacts = streamlit_app.load_release_artifacts(release_dir)
+    artifacts = demo.load_release_artifacts(release_dir)
 
-    assert isinstance(artifacts, streamlit_app.ReleaseArtifacts)
+    assert isinstance(artifacts, demo.ReleaseArtifacts)
     assert artifacts.release_dir == release_dir
     assert artifacts.manifest.feature_set == "challenger"
     assert isinstance(artifacts.preprocessor, RecordingPreprocessor)
@@ -344,6 +412,218 @@ def test_load_release_artifacts_validates_and_loads_typed_bundle(tmp_path: Path)
     assert artifacts.policy.approve_below == pytest.approx(0.25)
     assert artifacts.final_test_metrics["test_samples"] == 120
     assert artifacts.fairness_tables["income"].loc[0, "group"] == "A"
+
+
+def test_release_directory_rejects_noncanonical_environment_override(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_dir = _create_release(tmp_path)
+    release_alias = tmp_path / "release-alias"
+    release_alias.symlink_to(release_dir, target_is_directory=True)
+    monkeypatch.setenv("CREDIT_RISK_RELEASE_DIR", str(release_alias))
+
+    with pytest.raises(demo.StartupError, match="canonical"):
+        demo.release_directory()
+
+
+def test_cache_identity_reloads_same_path_replacement_and_does_not_reuse_valid_bundle(
+    tmp_path: Path,
+) -> None:
+    release_dir = _create_release(tmp_path)
+    streamlit_app.cached_release_artifacts.clear()
+    first_identity = demo.release_cache_identity(release_dir)
+
+    first = streamlit_app.cached_release_artifacts(*first_identity)
+
+    source_dir = release_dir.parent
+    joblib.dump(MissingClassesModel(), source_dir / "calibrated_model.joblib")
+    create_release_bundle(
+        source_dir,
+        release_dir,
+        version="test-2",
+        feature_set="challenger",
+        data_hash="b" * 64,
+    )
+    second_identity = demo.release_cache_identity(release_dir)
+
+    assert first.manifest.version == "test-1"
+    assert second_identity != first_identity
+    with pytest.raises(demo.StartupError, match="classes_"):
+        streamlit_app.cached_release_artifacts(*second_identity)
+    streamlit_app.cached_release_artifacts.clear()
+
+
+def test_load_release_artifacts_deserializes_verified_file_descriptors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_dir = _create_release(tmp_path)
+    real_joblib_load = joblib.load
+    descriptors: list[int] = []
+
+    def recording_joblib_load(input_file: object) -> object:
+        assert not isinstance(input_file, (str, Path))
+        assert callable(getattr(input_file, "fileno", None))
+        assert input_file.tell() == 0  # type: ignore[attr-defined]
+        descriptors.append(input_file.fileno())  # type: ignore[attr-defined]
+        return real_joblib_load(input_file)
+
+    monkeypatch.setattr(demo.joblib, "load", recording_joblib_load)
+
+    artifacts = demo.load_release_artifacts(release_dir)
+
+    assert isinstance(artifacts.preprocessor, RecordingPreprocessor)
+    assert isinstance(artifacts.model, FixedProbabilityModel)
+    assert len(descriptors) == 2
+
+
+@pytest.mark.parametrize("replacement_kind", ["regular-file", "symlink"])
+def test_load_release_artifacts_rejects_post_validation_artifact_substitution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_kind: str,
+) -> None:
+    release_dir = _create_release(tmp_path)
+    replacement = tmp_path / "replacement-model.joblib"
+    joblib.dump(MissingClassesModel(), replacement)
+    real_joblib_load = joblib.load
+    real_validate = demo.validate_release_bundle
+    deserialization_attempts: list[object] = []
+
+    def validate_then_replace(path: Path) -> object:
+        manifest = real_validate(path)
+        model_path = path / manifest.model_file
+        if replacement_kind == "regular-file":
+            replacement.replace(model_path)
+        else:
+            model_path.unlink()
+            model_path.symlink_to(replacement)
+        return manifest
+
+    def forbidden_joblib_load(input_file: object) -> object:
+        deserialization_attempts.append(input_file)
+        if len(deserialization_attempts) == 1:
+            return real_joblib_load(input_file)
+        raise AssertionError("substituted model reached joblib deserialization")
+
+    monkeypatch.setattr(demo, "validate_release_bundle", validate_then_replace)
+    monkeypatch.setattr(demo.joblib, "load", forbidden_joblib_load)
+
+    with pytest.raises(demo.StartupError, match="release bundle"):
+        demo.load_release_artifacts(release_dir)
+    assert len(deserialization_attempts) == 1
+
+
+def test_load_release_artifacts_runs_strict_operational_scoring_probe(tmp_path: Path) -> None:
+    release_dir = _create_release(tmp_path)
+
+    artifacts = demo.load_release_artifacts(release_dir)
+
+    assert len(artifacts.preprocessor.transform_calls) == 1
+    probe_frame = artifacts.preprocessor.transform_calls[0]
+    assert probe_frame.columns.tolist() == list(demo.SYNTHETIC_APPLICATION_VALUES)
+    assert probe_frame.loc[0].to_dict() == demo.SYNTHETIC_APPLICATION_VALUES
+    assert len(artifacts.model.predict_calls) == 1
+
+
+def test_load_release_artifacts_rejects_feature_dictionary_order_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_dir = _create_release(tmp_path)
+    numeric_columns, categorical_columns = feature_columns(
+        "challenger",
+        path=demo.FEATURE_DICTIONARY_PATH,
+    )
+    monkeypatch.setattr(
+        demo,
+        "feature_columns",
+        lambda *_args, **_kwargs: (list(reversed(numeric_columns)), categorical_columns),
+    )
+
+    with pytest.raises(demo.StartupError, match="feature order"):
+        demo.load_release_artifacts(release_dir)
+
+
+@pytest.mark.parametrize(
+    ("preprocessor", "model", "message"),
+    [
+        (
+            RecordingPreprocessor(feature_names=list(reversed(_application_payload()))),
+            FixedProbabilityModel(),
+            "feature_names_in_",
+        ),
+        (
+            RecordingPreprocessor(transformed=np.empty((1, 0))),
+            FixedProbabilityModel(),
+            "nonzero",
+        ),
+        (
+            RecordingPreprocessor(),
+            FixedProbabilityModel(n_features=3),
+            "n_features_in_",
+        ),
+        (
+            RecordingPreprocessor(),
+            FixedProbabilityModel(probabilities=(np.nan, np.nan)),
+            "finite",
+        ),
+    ],
+    ids=["input-feature-order", "zero-width-transform", "model-width", "nonfinite-probability"],
+)
+def test_load_release_artifacts_rejects_nonoperational_scoring_components(
+    tmp_path: Path,
+    preprocessor: object,
+    model: object,
+    message: str,
+) -> None:
+    release_dir = _create_release(tmp_path, preprocessor=preprocessor, model=model)
+
+    with pytest.raises(demo.StartupError, match=message):
+        demo.load_release_artifacts(release_dir)
+
+
+def test_load_release_artifacts_requires_probe_action_to_validate_strictly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release_dir = _create_release(tmp_path)
+    monkeypatch.setattr(
+        demo,
+        "assign_actions",
+        lambda *_args, **_kwargs: np.array(["unexpected_action"]),
+    )
+
+    with pytest.raises(demo.StartupError, match="action"):
+        demo.load_release_artifacts(release_dir)
+
+
+def test_load_release_artifacts_accepts_real_fitted_sklearn_components(tmp_path: Path) -> None:
+    numeric_columns, categorical_columns = feature_columns(
+        "challenger",
+        path=demo.FEATURE_DICTIONARY_PATH,
+    )
+    training_rows = []
+    for index in range(6):
+        row = dict(demo.SYNTHETIC_APPLICATION_VALUES)
+        row["loan_amnt"] = 10_000.0 + index * 2_500.0
+        row["annual_inc"] = 45_000.0 + index * 8_000.0
+        row["purpose"] = "credit_card" if index % 2 else "debt_consolidation"
+        training_rows.append(row)
+    training_frame = pd.DataFrame(
+        training_rows,
+        columns=[*numeric_columns, *categorical_columns],
+    )
+    labels = np.array([0, 1, 0, 1, 0, 1])
+    preprocessor = make_tree_preprocessor(numeric_columns, categorical_columns)
+    transformed = preprocessor.fit_transform(training_frame)
+    model = LogisticRegression(random_state=0).fit(transformed, labels)
+    release_dir = _create_release(tmp_path, preprocessor=preprocessor, model=model)
+
+    artifacts = demo.load_release_artifacts(release_dir)
+
+    assert artifacts.model.n_features_in_ == transformed.shape[1]
 
 
 def test_load_release_artifacts_rejects_contradictory_policy_provenance(
@@ -354,8 +634,8 @@ def test_load_release_artifacts_rejects_contradictory_policy_provenance(
         policy_overrides={"probability_source": "base_model_calibration_partition"},
     )
 
-    with pytest.raises(streamlit_app.StartupError, match="policy"):
-        streamlit_app.load_release_artifacts(release_dir)
+    with pytest.raises(demo.StartupError, match="policy"):
+        demo.load_release_artifacts(release_dir)
 
 
 @pytest.mark.parametrize(
@@ -387,8 +667,8 @@ def test_load_release_artifacts_rejects_invalid_frozen_components(
 ) -> None:
     release_dir = _create_release(tmp_path, **release_kwargs)
 
-    with pytest.raises(streamlit_app.StartupError, match=message):
-        streamlit_app.load_release_artifacts(release_dir)
+    with pytest.raises(demo.StartupError, match=message):
+        demo.load_release_artifacts(release_dir)
 
 
 @pytest.mark.parametrize(
@@ -430,8 +710,45 @@ def test_load_release_artifacts_rejects_cross_artifact_contradictions(
 ) -> None:
     release_dir = _create_release(tmp_path, **release_kwargs)
 
-    with pytest.raises(streamlit_app.StartupError, match=message):
-        streamlit_app.load_release_artifacts(release_dir)
+    with pytest.raises(demo.StartupError, match=message):
+        demo.load_release_artifacts(release_dir)
+
+
+@pytest.mark.parametrize(
+    ("contradiction", "message"),
+    [
+        ("explanation-model", "explanation_model.*artifact"),
+        ("missing-action", "local_explanations"),
+        ("policy-action", "policy_action"),
+        ("contribution-shape", "feature_value"),
+    ],
+    ids=["explanation-model", "missing-action", "policy-action", "contribution-shape"],
+)
+def test_load_release_artifacts_rejects_shap_contract_contradictions(
+    tmp_path: Path,
+    contradiction: str,
+    message: str,
+) -> None:
+    payload = _production_shap_explanations_payload()
+    explanation_model = payload["explanation_model"]
+    local_explanations = payload["local_explanations"]
+    assert isinstance(explanation_model, dict)
+    assert isinstance(local_explanations, dict)
+    if contradiction == "explanation-model":
+        explanation_model["artifact"] = "calibrated_model.joblib"
+    elif contradiction == "missing-action":
+        del local_explanations["decline"]
+    elif contradiction == "policy-action":
+        local_explanations["approve"]["policy_action"] = "decline"
+    else:
+        del local_explanations["approve"]["top_contributions"][0]["feature_value"]
+    release_dir = _create_release(
+        tmp_path,
+        shap_explanations_overrides=payload,
+    )
+
+    with pytest.raises(demo.StartupError, match=message):
+        demo.load_release_artifacts(release_dir)
 
 
 @pytest.mark.parametrize("failure", ["missing", "tampered"])
@@ -448,10 +765,10 @@ def test_load_release_artifacts_blocks_before_deserialization(
     def forbidden_joblib_load(_path: Path) -> object:
         raise AssertionError("unsafe bundle reached joblib deserialization")
 
-    monkeypatch.setattr(streamlit_app.joblib, "load", forbidden_joblib_load)
+    monkeypatch.setattr(demo.joblib, "load", forbidden_joblib_load)
 
-    with pytest.raises(streamlit_app.StartupError, match="release bundle"):
-        streamlit_app.load_release_artifacts(release_dir)
+    with pytest.raises(demo.StartupError, match="release bundle"):
+        demo.load_release_artifacts(release_dir)
 
 
 def test_predict_application_uses_strict_schema_frozen_transform_and_bad_class(
@@ -461,18 +778,18 @@ def test_predict_application_uses_strict_schema_frozen_transform_and_bad_class(
         tmp_path,
         model=FixedProbabilityModel(classes=(1, 0), probabilities=(0.2, 0.8)),
     )
-    artifacts = streamlit_app.load_release_artifacts(release_dir)
+    artifacts = demo.load_release_artifacts(release_dir)
     before = {path.name: path.read_bytes() for path in release_dir.iterdir()}
 
-    prediction = streamlit_app.predict_application(_application_payload(), artifacts)
+    prediction = demo.predict_application(_application_payload(), artifacts)
 
     assert isinstance(prediction, CreditPrediction)
     assert type(prediction.default_probability) is float
     assert prediction.default_probability == pytest.approx(0.2)
     assert prediction.action == "approve"
     assert prediction.explanation == [("numeric__dti", -0.4)]
-    assert len(artifacts.preprocessor.transform_calls) == 1
-    transformed_frame = artifacts.preprocessor.transform_calls[0]
+    assert len(artifacts.preprocessor.transform_calls) == 2
+    transformed_frame = artifacts.preprocessor.transform_calls[-1]
     assert transformed_frame.columns.tolist() == [
         "loan_amnt",
         "annual_inc",
@@ -499,12 +816,12 @@ def test_predict_application_uses_strict_schema_frozen_transform_and_bad_class(
 
 def test_predict_application_constructs_strict_credit_application(tmp_path: Path) -> None:
     release_dir = _create_release(tmp_path)
-    artifacts = streamlit_app.load_release_artifacts(release_dir)
+    artifacts = demo.load_release_artifacts(release_dir)
     invalid_payload = _application_payload()
     invalid_payload["loan_amnt"] = "25000"
 
     with pytest.raises(ValidationError, match="loan_amnt"):
-        streamlit_app.predict_application(invalid_payload, artifacts)
+        demo.predict_application(invalid_payload, artifacts)
 
 
 def test_predict_application_uses_frozen_policy_assignment(
@@ -515,7 +832,7 @@ def test_predict_application_uses_frozen_policy_assignment(
         tmp_path,
         model=FixedProbabilityModel(probabilities=(0.75, 0.25)),
     )
-    artifacts = streamlit_app.load_release_artifacts(release_dir)
+    artifacts = demo.load_release_artifacts(release_dir)
     observed: dict[str, object] = {}
 
     def recording_assign_actions(
@@ -531,9 +848,9 @@ def test_predict_application_uses_frozen_policy_assignment(
         )
         return np.array(["manual_review"])
 
-    monkeypatch.setattr(streamlit_app, "assign_actions", recording_assign_actions)
+    monkeypatch.setattr(demo, "assign_actions", recording_assign_actions)
 
-    prediction = streamlit_app.predict_application(_application_payload(), artifacts)
+    prediction = demo.predict_application(_application_payload(), artifacts)
 
     assert prediction.action == "manual_review"
     assert observed == {
@@ -545,8 +862,8 @@ def test_predict_application_uses_frozen_policy_assignment(
 
 def test_explanation_view_labels_release_example_as_association(tmp_path: Path) -> None:
     release_dir = _create_release(tmp_path)
-    artifacts = streamlit_app.load_release_artifacts(release_dir)
-    prediction = streamlit_app.predict_application(_application_payload(), artifacts)
+    artifacts = demo.load_release_artifacts(release_dir)
+    prediction = demo.predict_application(_application_payload(), artifacts)
 
     explanation = streamlit_app.explanation_view(prediction, artifacts)
 
@@ -555,6 +872,10 @@ def test_explanation_view_labels_release_example_as_association(tmp_path: Path) 
     assert explanation.number_format == "%+.4f"
     assert "assigned action" in explanation.context.lower()
     assert "not generated for the entered application" in explanation.context.lower()
+    assert "positive values increase" in explanation.context.lower()
+    assert "negative values decrease" in explanation.context.lower()
+    assert "base-model log-odds" in explanation.context.lower()
+    assert "not calibrated probability" in explanation.context.lower()
     assert explanation.table.to_dict("records") == [
         {"Feature": "numeric__dti", "Directional association (SHAP value)": -0.4}
     ]
@@ -563,12 +884,13 @@ def test_explanation_view_labels_release_example_as_association(tmp_path: Path) 
 def test_explanation_view_labels_global_fallback_as_unsigned_not_local_or_action_specific(
     tmp_path: Path,
 ) -> None:
-    release_dir = _create_release(
-        tmp_path,
-        shap_explanations_overrides={"local_explanations": {}},
+    release_dir = _create_release(tmp_path)
+    artifacts = demo.load_release_artifacts(release_dir)
+    artifacts = replace(
+        artifacts,
+        shap_explanations={"local_explanations": {}},
     )
-    artifacts = streamlit_app.load_release_artifacts(release_dir)
-    prediction = streamlit_app.predict_application(_application_payload(), artifacts)
+    prediction = demo.predict_application(_application_payload(), artifacts)
 
     explanation = streamlit_app.explanation_view(prediction, artifacts)
 
@@ -579,6 +901,7 @@ def test_explanation_view_labels_global_fallback_as_unsigned_not_local_or_action
     assert "not a local explanation" in explanation.context.lower()
     assert "not directional" in explanation.context.lower()
     assert "not action-specific" in explanation.context.lower()
+    assert "sign is not retained" in explanation.context.lower()
     assert explanation.table.to_dict("records") == [
         {"Feature": "numeric__dti", "Mean absolute association (unsigned)": 0.4}
     ]
@@ -634,8 +957,65 @@ def test_calibration_chart_reports_unavailable_when_no_finite_pairs(
     assert streamlit_app._render_calibration_chart(curve) is False
 
 
-def test_streamlit_app_uses_only_explicit_read_file_apis() -> None:
-    tree = ast.parse(APP_PATH.read_text(encoding="utf-8"))
+def test_business_cost_chart_groups_each_lgd_margin_scenario_without_cross_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[object] = []
+
+    def capture_chart(figure: object, **_kwargs: object) -> None:
+        captured.append(figure)
+
+    monkeypatch.setattr(streamlit_app.st, "plotly_chart", capture_chart)
+    sensitivity = _production_cost_sensitivity_frame().sample(frac=1.0, random_state=42)
+
+    rendered = streamlit_app._render_business_cost_sensitivity_chart(sensitivity)
+
+    assert rendered is True
+    assert len(captured) == 1
+    figure = captured[0]
+    assert len(figure.data) == 9
+    expected_groups = {
+        f"LGD {lgd:.0%} / Margin {margin:.0%}"
+        for lgd in (0.4, 0.6, 0.8)
+        for margin in (0.03, 0.05, 0.07)
+    }
+    assert {trace.name for trace in figure.data} == expected_groups
+    for trace in figure.data:
+        assert list(trace.x) == [10.0, 30.0, 50.0]
+        assert len(trace.y) == 3
+
+
+def test_business_cost_chart_reports_unavailable_for_missing_or_nonfinite_scenarios(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden_chart(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("invalid cost sensitivity must not render a chart")
+
+    monkeypatch.setattr(streamlit_app.st, "plotly_chart", forbidden_chart)
+    missing = pd.DataFrame({"review_cost": [10.0], "optimal_cost_per_1000_applications": [1.0]})
+    nonfinite = pd.DataFrame(
+        {
+            "lgd": [0.6],
+            "margin": [0.05],
+            "review_cost": [np.nan],
+            "optimal_cost_per_1000_applications": [1_500.0],
+        }
+    )
+
+    assert streamlit_app._render_business_cost_sensitivity_chart(missing) is False
+    assert streamlit_app._render_business_cost_sensitivity_chart(nonfinite) is False
+
+
+@pytest.mark.parametrize("source_path", [APP_PATH, DEMO_PATH], ids=["streamlit", "demo"])
+def test_demo_uses_only_explicit_read_file_apis(source_path: Path) -> None:
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+    read_only_flag_names = {
+        target.id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        for target in node.targets
+        if isinstance(target, ast.Name) and "os.O_RDONLY" in ast.unparse(node.value)
+    }
     prohibited_calls = {
         "dump",
         "set_query_params",
@@ -651,6 +1031,14 @@ def test_streamlit_app_uses_only_explicit_read_file_apis() -> None:
             continue
         assert node.func.attr not in prohibited_calls
         if node.func.attr != "open":
+            continue
+        if isinstance(node.func.value, ast.Name) and node.func.value.id == "os":
+            assert len(node.args) >= 2
+            flags = ast.unparse(node.args[1])
+            assert "os.O_RDONLY" in flags or flags in read_only_flag_names
+            assert "O_WRONLY" not in flags
+            assert "O_RDWR" not in flags
+            assert "O_CREAT" not in flags
             continue
         positional_mode = (
             node.args[0].value if node.args and isinstance(node.args[0], ast.Constant) else None
@@ -792,6 +1180,39 @@ def test_streamlit_workflow_renders_contract_and_assesses_synthetic_example(
     assert len(app.selectbox) == 4
     assert len(app.text_input) == 1
     assert len(app.get("plotly_chart")) == 3
+    assert app.selectbox[0].options == [
+        "debt_consolidation",
+        "credit_card",
+        "home_improvement",
+        "other",
+        "major_purchase",
+        "small_business",
+        "car",
+        "medical",
+        "moving",
+        "vacation",
+        "house",
+        "wedding",
+        "renewable_energy",
+        "educational",
+    ]
+    assert app.selectbox[3].options == [
+        "10+ years",
+        "9 years",
+        "8 years",
+        "7 years",
+        "6 years",
+        "5 years",
+        "4 years",
+        "3 years",
+        "2 years",
+        "1 year",
+        "< 1 year",
+        "n/a",
+    ]
+    initial_text = "\n".join(element.value for element in app.markdown)
+    assert "Joblib uses Python pickle semantics" in initial_text
+    assert "manifest hashes do not authenticate an untrusted bundle" in initial_text
 
     app = app.button[0].click().run(timeout=10)
 
