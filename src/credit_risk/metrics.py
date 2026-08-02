@@ -86,3 +86,80 @@ def binary_metrics(
         "fn": float(fn),
         "tp": float(tp),
     }
+
+
+def bootstrap_metric(
+    y_true: Sequence[int],
+    probabilities: Sequence[float],
+    *,
+    metric_name: str,
+    samples: int,
+    random_seed: int,
+) -> dict[str, float]:
+    metrics = {
+        "roc_auc": roc_auc_score,
+        "average_precision": average_precision_score,
+        "brier_score": brier_score_loss,
+    }
+    if not isinstance(metric_name, str) or metric_name not in metrics:
+        raise ValueError("metric_name must be one of roc_auc, average_precision, or brier_score")
+    if not isinstance(samples, int) or isinstance(samples, bool) or samples <= 0:
+        raise ValueError("samples must be a positive int and must not be bool")
+    if not isinstance(random_seed, int) or isinstance(random_seed, bool) or random_seed < 0:
+        raise ValueError("random_seed must be a nonnegative int and must not be bool")
+
+    target_values = _one_dimensional_array("y_true", y_true)
+    probability_values = _one_dimensional_array("probabilities", probabilities)
+    if len(target_values) != len(probability_values):
+        raise ValueError("y_true and probabilities must have the same length")
+
+    target_contains_boolean = np.issubdtype(target_values.dtype, np.bool_) or (
+        target_values.dtype == object
+        and any(isinstance(value, (bool, np.bool_)) for value in target_values)
+    )
+    if target_contains_boolean:
+        raise ValueError("y_true must not contain boolean values")
+    try:
+        contains_only_binary_values = bool(np.isin(target_values, [0, 1]).all())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("y_true values must be 0 or 1") from exc
+    if not contains_only_binary_values:
+        raise ValueError("y_true values must be 0 or 1")
+    target = target_values.astype(int, copy=False)
+    if not np.any(target == 0) or not np.any(target == 1):
+        raise ValueError("y_true must contain both classes 0 and 1")
+
+    probabilities_contain_boolean = np.issubdtype(probability_values.dtype, np.bool_) or (
+        probability_values.dtype == object
+        and any(isinstance(value, (bool, np.bool_)) for value in probability_values)
+    )
+    if probabilities_contain_boolean:
+        raise ValueError("probabilities must not contain boolean values")
+    try:
+        probability_array = probability_values.astype(float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("probabilities must contain only finite numeric values") from exc
+    if not np.isfinite(probability_array).all():
+        raise ValueError("probabilities must contain only finite numeric values")
+    if not ((probability_array >= 0.0) & (probability_array <= 1.0)).all():
+        raise ValueError("probabilities must be between 0 and 1")
+
+    metric = metrics[metric_name]
+    negative_indices = np.flatnonzero(target == 0)
+    positive_indices = np.flatnonzero(target == 1)
+    rng = np.random.default_rng(random_seed)
+    bootstrap_values = np.empty(samples, dtype=float)
+    for sample_index in range(samples):
+        indices = np.concatenate(
+            (
+                rng.choice(negative_indices, size=len(negative_indices), replace=True),
+                rng.choice(positive_indices, size=len(positive_indices), replace=True),
+            )
+        )
+        bootstrap_values[sample_index] = metric(target[indices], probability_array[indices])
+
+    return {
+        "estimate": float(metric(target, probability_array)),
+        "lower": float(np.quantile(bootstrap_values, 0.025)),
+        "upper": float(np.quantile(bootstrap_values, 0.975)),
+    }

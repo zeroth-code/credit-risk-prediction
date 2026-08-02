@@ -1,0 +1,494 @@
+import argparse
+import json
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_DIR = PROJECT_ROOT / "src"
+if str(SRC_DIR) not in sys.path:
+    sys.path.insert(0, str(SRC_DIR))
+
+import joblib  # noqa: E402
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+from sklearn.metrics import brier_score_loss, confusion_matrix, log_loss  # noqa: E402
+
+from credit_risk.calibration import expected_calibration_error  # noqa: E402
+from credit_risk.config import load_config  # noqa: E402
+from credit_risk.costs import assign_actions, policy_cost  # noqa: E402
+from credit_risk.features import build_feature_frame, load_feature_dictionary  # noqa: E402
+from credit_risk.metrics import binary_metrics, bootstrap_metric  # noqa: E402
+
+BASE_CONFIG_PATH = PROJECT_ROOT / "configs/base.yaml"
+FEATURE_DICTIONARY_PATH = PROJECT_ROOT / "configs/features.yaml"
+CLASSIFICATION_THRESHOLD = 0.5
+BOOTSTRAP_SAMPLES = 1000
+POLICY_FIELDS = (
+    "approve_below",
+    "decline_at",
+    "lgd",
+    "margin",
+    "review_cost",
+    "currency",
+    "selected_calibration_method",
+    "probability_source",
+    "selection_partition",
+    "threshold_selection_protocol",
+    "calibration_evaluation_protocol",
+)
+ALLOWED_POLICY_PROVENANCE = {
+    "selected_calibration_method": {"uncalibrated", "sigmoid", "isotonic"},
+    "probability_source": {"base_model_calibration_partition", "stratified_oof"},
+    "selection_partition": {"calibration"},
+    "threshold_selection_protocol": {"grid_search_on_calibration_evaluation_probabilities"},
+    "calibration_evaluation_protocol": {"stratified_oof", "base_model_holdout_only"},
+}
+TEMPORAL_COLUMNS = [
+    "month",
+    "status",
+    "count",
+    "prevalence",
+    "roc_auc",
+    "average_precision",
+    "brier_score",
+    "log_loss",
+    "expected_calibration_error",
+    "approval_rate",
+    "review_rate",
+    "decline_rate",
+    "policy_cost",
+    "policy_cost_per_1000_applications",
+    "total_exposure",
+    "currency",
+]
+
+
+def _project_path(path: str | Path) -> Path:
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate
+    return PROJECT_ROOT / candidate
+
+
+def _require_file(path: Path, description: str) -> None:
+    if not path.is_file():
+        raise FileNotFoundError(f"required {description} not found: {path}")
+
+
+def _load_joblib(path: Path, description: str) -> object:
+    _require_file(path, description)
+    try:
+        return joblib.load(path)
+    except Exception as exc:
+        raise ValueError(f"could not load {description} from {path}: {exc}") from exc
+
+
+def _finite_float(
+    payload: dict[str, object],
+    field: str,
+    *,
+    minimum: float,
+    maximum: float | None = None,
+) -> float:
+    value = payload[field]
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(f"policy field {field} must not be boolean")
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"policy field {field} must be a finite numeric value") from exc
+    if not np.isfinite(parsed) or parsed < minimum or (maximum is not None and parsed > maximum):
+        interval = f"[{minimum}, {maximum}]" if maximum is not None else f">= {minimum}"
+        raise ValueError(f"policy field {field} must be finite and in {interval}")
+    return parsed
+
+
+def _nonempty_string(payload: dict[str, object], field: str) -> str:
+    value = payload[field]
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"policy field {field} must be a non-empty string")
+    return value
+
+
+def _policy_provenance(payload: dict[str, object]) -> dict[str, str]:
+    provenance: dict[str, str] = {}
+    for field, allowed_values in ALLOWED_POLICY_PROVENANCE.items():
+        value = _nonempty_string(payload, field)
+        if value not in allowed_values:
+            allowed = ", ".join(sorted(allowed_values))
+            raise ValueError(f"policy field {field} must be one of: {allowed}")
+        provenance[field] = value
+    return provenance
+
+
+def _load_policy(path: Path) -> dict[str, object]:
+    _require_file(path, "frozen policy artifact")
+    try:
+        with path.open(encoding="utf-8") as policy_file:
+            payload = json.load(policy_file)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"could not load frozen policy from {path}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("frozen policy must be a JSON object")
+    missing = [field for field in POLICY_FIELDS if field not in payload]
+    if missing:
+        raise ValueError(f"frozen policy missing required fields: {', '.join(missing)}")
+
+    approve_below = _finite_float(payload, "approve_below", minimum=0.0, maximum=1.0)
+    decline_at = _finite_float(payload, "decline_at", minimum=0.0, maximum=1.0)
+    if approve_below >= decline_at:
+        raise ValueError("policy thresholds must satisfy approve_below < decline_at")
+    lgd = _finite_float(payload, "lgd", minimum=0.0, maximum=1.0)
+    margin = _finite_float(payload, "margin", minimum=0.0, maximum=1.0)
+    review_cost = _finite_float(payload, "review_cost", minimum=0.0)
+    currency = _nonempty_string(payload, "currency")
+    if currency != "USD":
+        raise ValueError("policy field currency must be USD")
+    provenance = _policy_provenance(payload)
+
+    return {
+        "approve_below": approve_below,
+        "decline_at": decline_at,
+        "lgd": lgd,
+        "margin": margin,
+        "review_cost": review_cost,
+        "currency": currency,
+        **provenance,
+    }
+
+
+def _validated_target(frame: pd.DataFrame) -> np.ndarray:
+    values = frame["bad"].to_numpy(copy=True)
+    contains_boolean = np.issubdtype(values.dtype, np.bool_) or (
+        values.dtype == object and any(isinstance(value, (bool, np.bool_)) for value in values)
+    )
+    if contains_boolean:
+        raise ValueError("test bad target must not contain boolean values")
+    try:
+        is_binary = bool(np.isin(values, [0, 1]).all())
+    except (TypeError, ValueError) as exc:
+        raise ValueError("test bad target must contain only 0 and 1") from exc
+    if not is_binary:
+        raise ValueError("test bad target must contain only 0 and 1")
+    target = values.astype(int, copy=False)
+    if not np.any(target == 0) or not np.any(target == 1):
+        raise ValueError("test bad target must contain both classes 0 and 1")
+    return target
+
+
+def _validated_loan_amounts(frame: pd.DataFrame) -> np.ndarray:
+    values = frame["loan_amnt"].to_numpy(copy=True)
+    contains_boolean = np.issubdtype(values.dtype, np.bool_) or (
+        values.dtype == object and any(isinstance(value, (bool, np.bool_)) for value in values)
+    )
+    if contains_boolean:
+        raise ValueError("test loan_amnt must not contain boolean values")
+    try:
+        amounts = np.asarray(pd.to_numeric(values, errors="raise"), dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("test loan_amnt must contain numeric values") from exc
+    if not np.isfinite(amounts).all():
+        raise ValueError("test loan_amnt must contain only finite values")
+    if not (amounts >= 0.0).all():
+        raise ValueError("test loan_amnt must contain only nonnegative values")
+    return amounts
+
+
+def _validated_months(frame: pd.DataFrame) -> np.ndarray:
+    try:
+        issue_dates = pd.to_datetime(frame["issue_d"], errors="raise")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("test issue_d must contain valid dates") from exc
+    if issue_dates.isna().any():
+        raise ValueError("test issue_d must not contain missing dates")
+    return issue_dates.dt.to_period("M").astype(str).to_numpy()
+
+
+def _validated_probabilities(model: object, matrix: object, expected_rows: int) -> np.ndarray:
+    predict_proba = getattr(model, "predict_proba", None)
+    if not callable(predict_proba):
+        raise ValueError("calibrated model artifact must provide predict_proba")
+    probability_matrix = np.asarray(predict_proba(matrix))
+    if probability_matrix.ndim != 2 or probability_matrix.shape != (expected_rows, 2):
+        raise ValueError(
+            "calibrated model predict_proba output must have shape "
+            f"({expected_rows}, 2), got {probability_matrix.shape}"
+        )
+    probabilities = probability_matrix[:, 1].astype(float, copy=False)
+    if not np.isfinite(probabilities).all():
+        raise ValueError("calibrated model probabilities must be finite")
+    if not ((probabilities >= 0.0) & (probabilities <= 1.0)).all():
+        raise ValueError("calibrated model probabilities must be between 0 and 1")
+    return probabilities
+
+
+def _policy_summary(
+    target: np.ndarray,
+    loan_amounts: np.ndarray,
+    actions: np.ndarray,
+    policy: dict[str, object],
+) -> dict[str, float]:
+    cost = policy_cost(
+        target,
+        loan_amounts,
+        actions,
+        lgd=float(policy["lgd"]),
+        margin=float(policy["margin"]),
+        review_cost=float(policy["review_cost"]),
+    )
+    return {
+        "approval_rate": float(np.mean(actions == "approve")),
+        "review_rate": float(np.mean(actions == "manual_review")),
+        "decline_rate": float(np.mean(actions == "decline")),
+        "policy_cost": cost,
+        "policy_cost_per_1000_applications": cost * 1000.0 / len(target),
+        "total_exposure": float(np.sum(loan_amounts)),
+    }
+
+
+def _temporal_metrics(
+    target: np.ndarray,
+    probabilities: np.ndarray,
+    loan_amounts: np.ndarray,
+    actions: np.ndarray,
+    months: np.ndarray,
+    policy: dict[str, object],
+) -> pd.DataFrame:
+    rows: list[dict[str, object]] = []
+    for month in sorted(set(months.tolist())):
+        members = months == month
+        monthly_target = target[members]
+        monthly_probabilities = probabilities[members]
+        monthly_actions = actions[members]
+        monthly_amounts = loan_amounts[members]
+        has_both_classes = bool(np.any(monthly_target == 0) and np.any(monthly_target == 1))
+        discrimination: dict[str, float | None]
+        if has_both_classes:
+            monthly_predictive = binary_metrics(
+                monthly_target,
+                monthly_probabilities,
+                threshold=CLASSIFICATION_THRESHOLD,
+            )
+            discrimination = {
+                "roc_auc": monthly_predictive["roc_auc"],
+                "average_precision": monthly_predictive["average_precision"],
+            }
+            status = "ok"
+        else:
+            discrimination = {"roc_auc": None, "average_precision": None}
+            status = "single_class_discrimination_undefined"
+        monthly_policy = _policy_summary(
+            monthly_target,
+            monthly_amounts,
+            monthly_actions,
+            policy,
+        )
+        rows.append(
+            {
+                "month": month,
+                "status": status,
+                "count": int(len(monthly_target)),
+                "prevalence": float(np.mean(monthly_target)),
+                **discrimination,
+                "brier_score": float(brier_score_loss(monthly_target, monthly_probabilities)),
+                "log_loss": float(log_loss(monthly_target, monthly_probabilities, labels=[0, 1])),
+                "expected_calibration_error": expected_calibration_error(
+                    monthly_target, monthly_probabilities
+                ),
+                "approval_rate": monthly_policy["approval_rate"],
+                "review_rate": monthly_policy["review_rate"],
+                "decline_rate": monthly_policy["decline_rate"],
+                "policy_cost": monthly_policy["policy_cost"],
+                "policy_cost_per_1000_applications": monthly_policy[
+                    "policy_cost_per_1000_applications"
+                ],
+                "total_exposure": monthly_policy["total_exposure"],
+                "currency": policy["currency"],
+            }
+        )
+    return pd.DataFrame.from_records(rows, columns=TEMPORAL_COLUMNS)
+
+
+def _write_json(path: Path, payload: dict[str, object]) -> None:
+    with path.open("w", encoding="utf-8") as output_file:
+        json.dump(payload, output_file, ensure_ascii=False, indent=2, sort_keys=True)
+        output_file.write("\n")
+
+
+def main(
+    *,
+    config_path: str | Path = BASE_CONFIG_PATH,
+    feature_dictionary_path: str | Path = FEATURE_DICTIONARY_PATH,
+) -> None:
+    resolved_config_path = _project_path(config_path)
+    resolved_feature_path = _project_path(feature_dictionary_path)
+    config = load_config(resolved_config_path)
+    feature_dictionary = load_feature_dictionary(resolved_feature_path)
+    challenger = feature_dictionary["challenger"]
+    selected_columns = list(challenger["numeric"]) + list(challenger["categorical"])  # type: ignore[index]
+
+    processed_dir = _project_path(config.processed_dir)
+    artifact_dir = _project_path(config.artifact_dir)
+    test_path = processed_dir / "test.parquet"
+    preprocessor_path = artifact_dir / "preprocessor.joblib"
+    model_path = artifact_dir / "calibrated_model.joblib"
+    policy_path = artifact_dir / "policy.json"
+    for path, description in (
+        (test_path, "test partition"),
+        (preprocessor_path, "frozen preprocessor artifact"),
+        (model_path, "frozen calibrated model artifact"),
+        (policy_path, "frozen policy artifact"),
+    ):
+        _require_file(path, description)
+
+    test_frame = pd.read_parquet(test_path)
+    if test_frame.empty:
+        raise ValueError("test partition must be non-empty")
+    required_columns = list(dict.fromkeys([*selected_columns, "bad", "issue_d", "loan_amnt"]))
+    missing_columns = [column for column in required_columns if column not in test_frame.columns]
+    if missing_columns:
+        raise ValueError(f"test partition missing required columns: {', '.join(missing_columns)}")
+    reserved_columns = [
+        column
+        for column in ("default_probability", "predicted_bad", "action")
+        if column in test_frame.columns
+    ]
+    if reserved_columns:
+        raise ValueError(
+            f"test partition contains reserved output columns: {', '.join(reserved_columns)}"
+        )
+
+    target = _validated_target(test_frame)
+    loan_amounts = _validated_loan_amounts(test_frame)
+    months = _validated_months(test_frame)
+    policy = _load_policy(policy_path)
+    feature_frame = build_feature_frame(
+        test_frame,
+        selected_columns,
+        path=resolved_feature_path,
+    )
+    preprocessor = _load_joblib(preprocessor_path, "frozen preprocessor artifact")
+    transform = getattr(preprocessor, "transform", None)
+    if not callable(transform):
+        raise ValueError("preprocessor artifact must provide transform")
+    transformed = transform(feature_frame)
+    transformed_shape = getattr(transformed, "shape", None)
+    if transformed_shape is None or transformed_shape[0] != len(test_frame):
+        raise ValueError("preprocessor transform output rows must align with the test partition")
+    model = _load_joblib(model_path, "frozen calibrated model artifact")
+    probabilities = _validated_probabilities(model, transformed, len(test_frame))
+    predictions = (probabilities >= CLASSIFICATION_THRESHOLD).astype(int)
+    actions = assign_actions(
+        probabilities,
+        approve_below=float(policy["approve_below"]),
+        decline_at=float(policy["decline_at"]),
+    )
+    if not len(target) == len(probabilities) == len(predictions) == len(actions):
+        raise RuntimeError("target, probability, prediction, and action rows are not aligned")
+
+    predictive_metrics = binary_metrics(
+        target,
+        probabilities,
+        threshold=CLASSIFICATION_THRESHOLD,
+    )
+    confidence_intervals = {
+        metric_name: bootstrap_metric(
+            target,
+            probabilities,
+            metric_name=metric_name,
+            samples=BOOTSTRAP_SAMPLES,
+            random_seed=config.random_seed,
+        )
+        for metric_name in ("roc_auc", "average_precision", "brier_score")
+    }
+    policy_summary = _policy_summary(target, loan_amounts, actions, policy)
+    temporal = _temporal_metrics(
+        target,
+        probabilities,
+        loan_amounts,
+        actions,
+        months,
+        policy,
+    )
+
+    final_metrics: dict[str, object] = {
+        "test_samples": int(len(target)),
+        "prevalence": float(np.mean(target)),
+        "predictive_metrics": predictive_metrics,
+        "expected_calibration_error": expected_calibration_error(target, probabilities),
+        "confidence_intervals": confidence_intervals,
+        "classification_threshold": CLASSIFICATION_THRESHOLD,
+        "model_provenance": {
+            "feature_set": "challenger",
+            "evaluation_partition": "test",
+            "preprocessor_artifact": preprocessor_path.name,
+            "model_artifact": model_path.name,
+            "probability_source": "frozen_calibrated_model",
+        },
+        "policy_provenance": {
+            "policy_artifact": policy_path.name,
+            "approve_below": policy["approve_below"],
+            "decline_at": policy["decline_at"],
+            "selection_partition": policy["selection_partition"],
+            "threshold_selection_protocol": policy["threshold_selection_protocol"],
+        },
+    }
+    confusion = confusion_matrix(target, predictions, labels=[0, 1])
+    confusion_rows = [
+        {
+            "actual_label": actual_label,
+            "predicted_label": predicted_label,
+            "count": int(confusion[actual_label, predicted_label]),
+        }
+        for actual_label in (0, 1)
+        for predicted_label in (0, 1)
+    ]
+    policy_results: dict[str, object] = {
+        **policy,
+        "test_samples": int(len(target)),
+        "total_exposure": policy_summary["total_exposure"],
+        "test_cost": policy_summary["policy_cost"],
+        "test_cost_per_1000_applications": policy_summary["policy_cost_per_1000_applications"],
+        "test_approval_rate": policy_summary["approval_rate"],
+        "test_review_rate": policy_summary["review_rate"],
+        "test_decline_rate": policy_summary["decline_rate"],
+    }
+    scored = test_frame.copy(deep=True)
+    scored["default_probability"] = probabilities
+    scored["predicted_bad"] = predictions
+    scored["action"] = actions
+    if len(scored) != len(test_frame):
+        raise RuntimeError("scored test rows are not aligned with the input test partition")
+
+    _write_json(artifact_dir / "final_test_metrics.json", final_metrics)
+    pd.DataFrame.from_records(
+        confusion_rows,
+        columns=["actual_label", "predicted_label", "count"],
+    ).to_csv(artifact_dir / "confusion_matrix.csv", index=False, encoding="utf-8")
+    _write_json(artifact_dir / "policy_test_results.json", policy_results)
+    temporal.to_csv(artifact_dir / "temporal_metrics.csv", index=False, encoding="utf-8")
+    scored.to_parquet(artifact_dir / "scored_test.parquet", index=False)
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Evaluate frozen credit-risk artifacts on the out-of-time test partition"
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=BASE_CONFIG_PATH,
+        help="project config path (default: configs/base.yaml)",
+    )
+    parser.add_argument(
+        "--features",
+        type=Path,
+        default=FEATURE_DICTIONARY_PATH,
+        help="feature dictionary path (default: configs/features.yaml)",
+    )
+    return parser.parse_args(argv)
+
+
+if __name__ == "__main__":
+    arguments = parse_args()
+    main(config_path=arguments.config, feature_dictionary_path=arguments.features)
