@@ -181,6 +181,10 @@ def _temporary_sibling(path: Path, token: str, role: str) -> Path:
     return path.with_name(f".{path.name}.{token}.{role}")
 
 
+def _recovery_backup_path(release_dir: Path, final_path: Path, token: str) -> Path:
+    return release_dir.parent / (f".{release_dir.name}.{final_path.name}.{token}.recovery.backup")
+
+
 def _retry_unlink(path: Path) -> OSError | None:
     last_error: OSError | None = None
     for _ in range(FILESYSTEM_OPERATION_ATTEMPTS):
@@ -240,16 +244,14 @@ def _validate_manifest_inventory(
         if extra:
             details.append(f"unexpected: {', '.join(extra)}")
         raise ValueError(f"release inventory does not match contract ({'; '.join(details)})")
-    core_paths = {manifest.model_file, manifest.preprocessor_file, manifest.policy_file}
-    expected_core_paths = {
-        "calibrated_model.joblib",
-        "preprocessor.joblib",
-        "policy.json",
+    core_paths = {
+        "model_file": (manifest.model_file, "calibrated_model.joblib"),
+        "preprocessor_file": (manifest.preprocessor_file, "preprocessor.joblib"),
+        "policy_file": (manifest.policy_file, "policy.json"),
     }
-    if core_paths != expected_core_paths:
-        raise ValueError(
-            "release manifest must reference the stable model, preprocessor, and policy"
-        )
+    for field, (actual, expected) in core_paths.items():
+        if actual != expected:
+            raise ValueError(f"release manifest {field} must be {expected}")
     if set(paths_by_release_path) != inventory_names:
         raise ValueError("release files do not match manifest inventory")
     for item in manifest.files:
@@ -373,7 +375,7 @@ def create_release_bundle(
     known_finals = [*(final_paths[name] for name in RELEASE_ARTIFACT_NAMES), manifest_final]
     previous_paths = [*known_finals, *stale_final_paths]
     backup_paths = {
-        final_path: _temporary_sibling(final_path, token, "recovery.backup")
+        final_path: _recovery_backup_path(release_path, final_path, token)
         for final_path in previous_paths
     }
     temporary_paths = [*staged_paths.values(), manifest_staged, *backup_paths.values()]
@@ -428,13 +430,11 @@ def create_release_bundle(
         manifest_staged.replace(manifest_final)
         manifest_committed = True
 
-        cleanup_notes = _cleanup_temporary_files(list(backup_paths.values()))
+        _cleanup_temporary_files(list(backup_paths.values()))
         _require_regular_nonempty_file(manifest_final, "published release manifest")
         if load_manifest(manifest_final) != manifest:
             raise RuntimeError("published release manifest did not match staged manifest")
         _validate_manifest_inventory(manifest, final_paths)
-        if cleanup_notes:
-            return manifest
         return validate_release_bundle(release_path)
     except Exception as publication_error:
         recovery_notes: list[str] = []

@@ -447,6 +447,23 @@ def test_validate_release_bundle_rejects_tampered_core_names_or_inventory_metada
         validate_release_bundle(release_dir)
 
 
+def test_validate_release_bundle_rejects_swapped_model_and_preprocessor_roles(
+    tmp_path: Path,
+) -> None:
+    source_dir = tmp_path / "artifacts"
+    release_dir = source_dir / "release"
+    _write_release_sources(source_dir)
+    _create_bundle(source_dir, release_dir)
+    manifest_path = release_dir / "release_manifest.json"
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    payload["model_file"] = "preprocessor.joblib"
+    payload["preprocessor_file"] = "calibrated_model.joblib"
+    manifest_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    with pytest.raises(ValueError):
+        validate_release_bundle(release_dir)
+
+
 def test_create_release_bundle_rejects_invalid_data_hash_and_symlink_source(
     tmp_path: Path,
 ) -> None:
@@ -580,12 +597,12 @@ def test_create_release_bundle_preserves_unresolved_recovery_backup(
 
     backups = [
         path
-        for path in release_dir.iterdir()
-        if path.name.startswith(".calibrated_model.joblib")
-        and path.name.endswith("recovery.backup")
+        for path in source_dir.iterdir()
+        if "calibrated_model.joblib" in path.name and path.name.endswith("recovery.backup")
     ]
     assert len(backups) == 1
     assert backups[0].read_bytes() == previous_model
+    assert not [path for path in release_dir.iterdir() if path.name.endswith("recovery.backup")]
     assert any("release recovery failed" in note for note in exc_info.value.__notes__)
 
 
@@ -665,6 +682,7 @@ def test_create_release_bundle_does_not_report_failure_after_manifest_commit(
     release_dir = source_dir / "release"
     _write_release_sources(source_dir, prefix="old")
     _create_bundle(source_dir, release_dir)
+    previous_model = (release_dir / "calibrated_model.joblib").read_bytes()
     for path in source_dir.iterdir():
         if path.is_file():
             path.write_bytes(f"new:{path.name}\n".encode())
@@ -672,9 +690,7 @@ def test_create_release_bundle_does_not_report_failure_after_manifest_commit(
     original_unlink = Path.unlink
 
     def fail_one_backup_cleanup(self: Path, *args: object, **kwargs: object) -> None:
-        if self.name.startswith(".calibrated_model.joblib") and self.name.endswith(
-            "recovery.backup"
-        ):
+        if "calibrated_model.joblib" in self.name and self.name.endswith("recovery.backup"):
             raise OSError("persistent post-commit cleanup failure")
         original_unlink(self, *args, **kwargs)
 
@@ -682,9 +698,12 @@ def test_create_release_bundle_does_not_report_failure_after_manifest_commit(
 
     manifest = _create_bundle(source_dir, release_dir)
 
-    assert load_manifest(release_dir / "release_manifest.json") == manifest
-    for item in manifest.files:
-        assert sha256_file(release_dir / item.path) == item.sha256
-        assert (release_dir / item.path).stat().st_size == item.size_bytes
-    backups = [path for path in release_dir.iterdir() if path.name.endswith("recovery.backup")]
+    assert validate_release_bundle(release_dir) == manifest
+    assert not [path for path in release_dir.iterdir() if path.name.endswith("recovery.backup")]
+    backups = [
+        path
+        for path in source_dir.iterdir()
+        if "calibrated_model.joblib" in path.name and path.name.endswith("recovery.backup")
+    ]
     assert len(backups) == 1
+    assert backups[0].read_bytes() == previous_model
