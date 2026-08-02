@@ -93,8 +93,10 @@ This is both a subgroup reliability signal and a missing-data monitoring concern
 ### Region
 
 Regional selection rates are closer together, from 8.8961% in the Midwest to 9.8733% in the
-West. The 0.901025 ratio and 0.010746 equal-opportunity difference are more stable than the
-other available grouping results, but they do not demonstrate protected-class fairness.
+West. The 0.901025 ratio and 0.010746 equal-opportunity difference describe this frozen test
+sample only. The release provides no subgroup confidence intervals or repeated out-of-time
+subgroup measurements, so this proximity must not be interpreted as stability or evidence of
+protected-class fairness.
 
 ## Instability and Interpretation Warnings
 

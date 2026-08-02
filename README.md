@@ -103,10 +103,6 @@ challenger LightGBM strategies. Its positive-class weight is 6.9875. A 30-trial 
 selects 894 estimators, learning rate 0.0107234, 33 leaves, and the remaining regularization
 parameters recorded in `artifacts/release/validation_metrics.json`.
 
-The scikit-learn SAG-family (`saga`) logistic baselines reached `max_iter=2000` with convergence
-warnings during the real training run. Their metrics are retained as comparison evidence, but
-their fitted coefficients should not be treated as fully converged estimates.
-
 ## Probability Calibration
 
 Uncalibrated, sigmoid, and isotonic methods are compared on the calibration partition.
@@ -225,15 +221,18 @@ Static checks use `uv run ruff check .`.
 
 ## Docker
 
-Build and run the application image from the repository root:
+Docker packaging is pending Task 17. This commit does not contain a `Dockerfile`, so the
+following planned commands are not runnable yet. After Task 17 adds the packaging, the
+intended interface is:
 
 ```bash
 docker build -t credit-risk-prediction .
 docker run --rm -p 8501:8501 credit-risk-prediction
 ```
 
-The runtime must contain the frozen release bundle expected by the application. Do not load
-untrusted joblib files; Python pickle semantics can execute code during deserialization.
+When packaging exists, the runtime must contain the frozen release bundle expected by the
+application. Do not load untrusted joblib files; Python pickle semantics can execute code
+during deserialization.
 
 ## Limitations and Responsible Use
 
@@ -241,7 +240,6 @@ untrusted joblib files; Python pickle semantics can execute code during deserial
 - The conventional 0.5 classifier predicts no defaults on test data.
 - The cost policy sends 90.6% to manual review and declines none, so it is not operationally
   ready without capacity analysis and policy redesign.
-- Logistic `saga` baselines emitted maximum-iteration convergence warnings.
 - LendingClub accepted loans are a historically selected sample, not the full applicant
   population; rejected-applicant risk and reject inference are unavailable.
 - Protected attributes are absent. The project provides no causal interpretation, no

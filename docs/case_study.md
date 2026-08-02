@@ -62,8 +62,7 @@ home-ownership selection-rate differences, while explicitly stopping short of a 
 
 The project is trained on a historical selected sample of approved loans and cannot observe
 rejected-applicant outcomes. Protected attributes are absent, preventing statutory
-fair-lending analysis and intersectional validation. The logistic `saga` baselines also
-emitted maximum-iteration convergence warnings.
+fair-lending analysis and intersectional validation.
 
 The result is a portfolio demonstration of disciplined temporal evaluation, calibration, cost
 policy, explainability, and reliability reporting. It is not a causal model, a legal compliance

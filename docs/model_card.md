@@ -57,10 +57,6 @@ Natural full-underwriting LightGBM reaches validation average precision 0.226573
 feature set contains `int_rate`, `grade`, and `sub_grade`, which encode lender underwriting
 decisions and are excluded from the release challenger.
 
-The logistic baselines use scikit-learn's `saga` solver with `max_iter=2000`. The real run
-emitted maximum-iteration convergence warnings, so the recorded logistic metrics are useful
-comparators but the coefficient solutions are not treated as fully converged.
-
 ## Preprocessing
 
 The release preprocessor is fitted on train only:
