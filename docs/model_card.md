@@ -70,17 +70,17 @@ The release preprocessor is fitted on train only:
 
 The frozen LightGBM uses the tree preprocessor, so its numeric columns are not standardized.
 
-## Validation Design and Partition Ownership
+## Validation Design and Partition Roles
 
-| Partition | Dates | Rows | Permitted use |
+| Partition | Dates | Rows | Reported role |
 | --- | --- | ---: | --- |
 | Train | 2011-01 through 2013-12 | 157,993 | Fit preprocessors and base estimators |
 | Validation | 2014-01 through 2014-06 | 71,955 | Select experiments, imbalance strategy, and Optuna parameters |
 | Calibration | 2014-07 through 2014-12 | 90,615 | Compare/refit calibration and select cost thresholds |
-| Test | 2015-01 through 2015-12 | 283,026 | Final evaluation and post-selection diagnostics only |
+| Test | 2015-01 through 2015-12 | 283,026 | Reported final evaluation and post-selection diagnostics |
 
-The split is chronological by issue date. The test set is not used for model, calibration, or
-threshold selection.
+The split is chronological by issue date. The documented protocol reserves test for final
+evaluation rather than model, calibration, or threshold selection.
 
 ## Calibration
 
@@ -97,6 +97,15 @@ threshold selection. Sigmoid is selected, then refit on the full calibration par
 Sigmoid is selected by the calibration selection rule and is the method recorded in the
 frozen policy and release manifest.
 
+ECE is the sample-weighted absolute gap between mean predicted PD and observed default rate
+across 10 equal-width probability bins, with the final bin including its upper endpoint. The
+calibration table uses 5-fold OOF predictions at 14.1257% prevalence; the final test metrics
+use a single sigmoid calibrator refit on all calibration rows and a holdout at 14.8863%
+prevalence. Brier score is prevalence sensitive, and the evaluation protocols differ, so its
+increase on test is not proof of calibration drift. The later test ECE of 0.011108, compared
+with calibration OOF ECE 0.000448, is consistent with degraded temporal calibration but is
+not definitive evidence by itself.
+
 ## Selected Thresholds
 
 Thresholds are grid-searched on sigmoid calibration out-of-fold probabilities under the base
@@ -111,9 +120,9 @@ operationally ready and should not be presented as a deployable decision policy.
 
 ## Final Test Metrics
 
-The out-of-time test set contains 283,026 loans, including 42,132 bad loans (14.8863%). The
-confidence intervals use 1,000 stratified bootstrap samples, percentile intervals, 95%
-coverage, and random seed 42.
+The test partition is reserved for final evaluation, and the reported final evaluation uses
+the 2015 holdout of 283,026 loans, including 42,132 bad loans (14.8863%). The nominal 95%
+percentile confidence intervals use 1,000 stratified bootstrap samples and random seed 42.
 
 | Metric | Estimate | 95% confidence interval |
 | --- | ---: | --- |
@@ -131,22 +140,34 @@ modest, and the model must be assessed as a probability-ranking system rather th
 
 ## Cost Scenarios
 
-The base policy assumes LGD 60%, foregone margin 5%, and USD 30 per manual review. On USD
-3,624,300,800 of test exposure, its measured scenario cost is USD 16,272,165, or USD 57,493.53
-per 1,000 applications.
+The base policy assumes LGD 60%, foregone margin 5%, and USD 30 per manual review. The
+implemented equation is:
+
+```text
+proxy_cost = LGD * sum(loan_amnt for approved bad loans)
+           + margin * sum(loan_amnt for declined good loans)
+           + review_cost * count(manual_review)
+```
+
+`manual_review` is terminal in this equation and incurs only the USD 30 fee. Reviewer
+downstream approval or decline, credit loss, and foregone margin are omitted. On USD
+3,624,300,800 of test exposure, the resulting partial scenario-cost proxy is USD 16,272,165,
+or USD 57,493.53 per 1,000 applications. It is not a complete operating-cost estimate,
+especially because 90.6447% of test rows end at `manual_review` in the proxy.
 
 The calibration sensitivity grid contains 27 combinations of LGD 40%-80%, margin 3%-8%, and
-review cost USD 15-60. Recorded scenario costs range from USD 29,985.60 to USD 87,387.52 per
-1,000. Every recorded scenario selects the same 0.05/0.45 threshold pair and produces no
-declines, so margin does not affect these scenario totals. There is no validated comparator
-policy in the release artifacts; no cost-improvement claim is made.
+review cost USD 15-60. Recorded partial scenario-cost proxies range from USD 29,985.60 to USD
+87,387.52 per 1,000. Every recorded scenario selects the same 0.05/0.45 threshold pair and
+produces no declines, so margin does not affect these scenario totals. There is no validated
+comparator policy in the release artifacts; no cost-improvement claim is made.
 
 ## SHAP Interpretation
 
 SHAP uses a reproducible 5,000-row test sample and the frozen uncalibrated LightGBM explanation
-model. The five leading mean-absolute SHAP features are annual income, lower FICO, recent
-inquiries, loan amount, and DTI. Local examples exist for approve and manual review. No decline
-example exists because the test policy produced no declines.
+model. The five leading mean-absolute SHAP features are annual income, `fico_range_low` (the
+lower bound of the reported FICO range), recent inquiries, loan amount, and DTI. Mean-absolute
+importance does not establish feature direction. Local examples exist for approve and manual
+review. No decline example exists because the test policy produced no declines.
 
 Values are raw base-model log-odds contributions. They do not decompose the calibrated PD,
 prove causation, establish fairness, or provide legally sufficient adverse-action reasons.
@@ -189,7 +210,7 @@ its own control limits and, at minimum, trigger investigation and possible retra
 
 Retraining must repeat temporal validation, calibration, policy selection, fairness analysis,
 documentation, and independent approval. It must not tune against previously disclosed test
-results without establishing a new untouched holdout.
+results without establishing a new reserved holdout.
 
 ## Limitations and Ethical Considerations
 
@@ -198,5 +219,7 @@ results without establishing a new untouched holdout.
 - The release offers no causal interpretation and no legal compliance conclusion.
 - Modest discrimination, zero default classifications at 0.5, and a 90.6% review rate are major
   operational limitations.
+- The cost result is a partial proxy: reviewed rows receive a terminal fee without modeled
+  downstream decisions, credit loss, or foregone margin.
 - External validity beyond LendingClub's historical 2011-2015 population is unproven.
 - This is a demonstration only, not a production lending decision system.

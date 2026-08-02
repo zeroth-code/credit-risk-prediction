@@ -47,10 +47,16 @@ judged by accuracy alone.
 
 ## Dataset and Outcome Window
 
-The source is the Kaggle LendingClub accepted-loans CSV covering 2007 through 2018 Q4. Access
-requires a personal Kaggle account and acceptance of the dataset terms. The verified raw file
-is 1,675,133,810 bytes with SHA-256
+The underlying source is LendingClub. The local CSV was obtained from the Kaggle dataset
+[`wordsforthewise/lending-club`](https://www.kaggle.com/datasets/wordsforthewise/lending-club),
+published by Kaggle account `wordsforthewise`, and covers 2007 through 2018 Q4. The local copy
+receipt/retrieval date is 2026-08-02; its filename is `accepted_2007_to_2018Q4.csv`, size is
+1,675,133,810 bytes, and SHA-256 is
 `3eae03c28fd9d2e8a076ebeb73507e8d4d0f44d90500decdb0936e0933d1f36a`.
+
+The Kaggle version ID and license metadata were not persisted with the local snapshot. This
+repository does not redistribute the raw CSV. Users must obtain it from the dataset page under
+the page's current license and terms.
 
 The population pipeline starts with 2,260,701 accepted-loan rows. After date, 36-month term,
 and final-outcome filters, 1,020,768 rows are eligible. Of these, 603,589 fall into the defined
@@ -67,7 +73,7 @@ next-payment dates, and later credit pulls. It also excludes `int_rate`, `grade`
 `sub_grade` from the release challenger because those fields encode lender underwriting
 decisions.
 
-Temporal ownership is enforced:
+The reported workflow assigns distinct partition roles:
 
 - train fits preprocessors and candidate models;
 - validation compares feature sets, models, imbalance strategies, and 30 Optuna trials;
@@ -76,16 +82,17 @@ Temporal ownership is enforced:
 - test is reserved for final metrics, policy evaluation, SHAP sampling, and subgroup
   diagnostics.
 
-No test result participates in model, calibration-method, or threshold selection.
+In the reported workflow, test results are not inputs to model, calibration-method, or
+threshold selection.
 
 ## Temporal Validation Design
 
-| Partition | Issue dates | Rows | Ownership |
+| Partition | Issue dates | Rows | Reported role |
 | --- | --- | ---: | --- |
 | Train | 2011-01-01 to 2013-12-31 | 157,993 | Preprocessing and model fitting |
 | Validation | 2014-01-01 to 2014-06-30 | 71,955 | Model, feature-set, imbalance, and tuning selection |
 | Calibration | 2014-07-01 to 2014-12-31 | 90,615 | Calibration evaluation/refit and policy thresholds |
-| Test | 2015-01-01 to 2015-12-31 | 283,026 | One-way final evaluation and diagnostics |
+| Test | 2015-01-01 to 2015-12-31 | 283,026 | Reported final evaluation and diagnostics |
 
 The partitions follow issue date rather than a random split. Test prevalence rises from
 12.5195% in train to 14.8863% in test, making temporal drift part of the evaluation rather
@@ -112,8 +119,12 @@ selected with calibration Brier score 0.116482, log loss 0.386624, and expected 
 error 0.000448.
 
 The frozen scoring artifact is a `CalibratedClassifierCV` around the selected LightGBM model.
-Calibration improves probability interpretation on its selection partition, but the higher
-test Brier score and ECE show that calibration still changes over time.
+The calibration figures above use 5-fold out-of-fold predictions on a partition with 14.1257%
+prevalence, while the final test metrics use the single sigmoid calibrator refit on the full
+calibration partition and a holdout with 14.8863% prevalence. Brier score is prevalence
+sensitive, and the protocols differ, so the increase from calibration to test is not proof of
+calibration drift. The later test ECE of 0.011108, compared with calibration OOF ECE 0.000448,
+is consistent with degraded temporal calibration but is not definitive evidence by itself.
 
 ## Business Cost Policy
 
@@ -124,20 +135,32 @@ and USD 30 per manual review. Thresholds are selected on calibration out-of-fold
 - manual review when 0.05 <= PD < 0.45;
 - decline when PD >= 0.45.
 
+The implemented cost equation is:
+
+```text
+proxy_cost = LGD * sum(loan_amnt for approved bad loans)
+           + margin * sum(loan_amnt for declined good loans)
+           + review_cost * count(manual_review)
+```
+
+`manual_review` is modeled as a terminal USD 30 fee only. The reviewer's downstream approval
+or decline, subsequent credit loss, and foregone margin are omitted.
+
 On the test set, this policy approves 9.3553%, sends 90.6447% to manual review, and declines
-0%. Across USD 3,624,300,800 of test exposure, the stated base scenario costs USD 16,272,165,
-or USD 57,493.53 per 1,000 applications.
+0%. Across USD 3,624,300,800 of test exposure, the partial scenario-cost proxy is USD
+16,272,165, or USD 57,493.53 per 1,000 applications. It is not a complete operating-cost
+estimate, especially with 90.6% of applications ending at the modeled review fee.
 
 The 27 calibration sensitivity scenarios span LGD 40%-80%, margin 3%-8%, and manual-review
-cost USD 15-60. Scenario cost ranges from USD 29,985.60 to USD 87,387.52 per 1,000. No valid
-comparator policy is present in the release artifacts, so this project does not claim an
-unsupported cost improvement.
+cost USD 15-60. The partial scenario-cost proxy ranges from USD 29,985.60 to USD 87,387.52 per
+1,000. No valid comparator policy is present in the release artifacts, so this project does
+not claim an unsupported cost improvement.
 
 ## Results
 
-Final results are measured once on the 2015 out-of-time test partition. Confidence intervals
-use 1,000 stratified bootstrap samples, percentile intervals, a 95% confidence level, and
-random seed 42.
+The test partition is reserved for final evaluation, and the reported final evaluation uses
+the 2015 holdout. The nominal 95% percentile confidence intervals use 1,000 stratified
+bootstrap samples and random seed 42.
 
 | Metric | Test estimate | 95% CI |
 | --- | ---: | --- |
@@ -148,6 +171,9 @@ random seed 42.
 | KS | 0.236654 | Not bootstrapped |
 | Expected calibration error | 0.011108 | Not bootstrapped |
 
+ECE is the sample-weighted absolute gap between mean predicted PD and observed default rate
+across 10 equal-width probability bins; the final bin includes its upper endpoint.
+
 Discrimination is modest. Monthly 2015 ROC AUC ranges from 0.6542 to 0.6742 and monthly ECE
 from 0.00235 to 0.01947; these are retrospective stability diagnostics, not evidence of live
 production robustness.
@@ -155,9 +181,10 @@ production robustness.
 ## SHAP Explainability
 
 Global SHAP evidence uses a reproducible 5,000-row test sample. The leading associations are
-annual income, lower FICO score, recent inquiries, loan amount, and debt-to-income ratio.
-Local examples are available for approve and manual-review actions. A decline example is not
-shown because the frozen test policy produced no declines.
+annual income, `fico_range_low` (the lower bound of the reported FICO range), recent inquiries,
+loan amount, and debt-to-income ratio. Mean-absolute SHAP importance does not establish a
+direction for these features. Local examples are available for approve and manual-review
+actions. A decline example is not shown because the frozen test policy produced no declines.
 
 The SHAP values explain the uncalibrated base LightGBM output in raw log-odds units. They are
 directional statistical associations, not causal effects, adverse-action reasons, or an
@@ -197,7 +224,14 @@ documentation change.
 ## Reproduce Locally
 
 Python 3.12 and access to the Kaggle source CSV are required. Place
-`accepted_2007_to_2018Q4.csv` in `data/raw/`, verify its hash against the data card, then run:
+`accepted_2007_to_2018Q4.csv` in `data/raw/` after obtaining it under the Kaggle dataset page's
+current license and terms. Verify the exact local snapshot:
+
+```bash
+shasum -a 256 data/raw/accepted_2007_to_2018Q4.csv
+```
+
+Then run:
 
 ```bash
 uv sync --dev
@@ -240,6 +274,9 @@ during deserialization.
 - The conventional 0.5 classifier predicts no defaults on test data.
 - The cost policy sends 90.6% to manual review and declines none, so it is not operationally
   ready without capacity analysis and policy redesign.
+- Manual review is modeled as a terminal fee only. The partial cost proxy omits downstream
+  reviewer decisions and their credit-loss or foregone-margin outcomes, so it is not a complete
+  operating-cost estimate.
 - LendingClub accepted loans are a historically selected sample, not the full applicant
   population; rejected-applicant risk and reject inference are unavailable.
 - Protected attributes are absent. The project provides no causal interpretation, no

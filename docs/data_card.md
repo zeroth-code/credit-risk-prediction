@@ -8,11 +8,24 @@ does not represent all credit applicants.
 
 ## Source and Access
 
-- Source: Kaggle LendingClub accepted loans, 2007 through 2018 Q4.
-- Expected file: `data/raw/accepted_2007_to_2018Q4.csv`.
-- Access: a personal Kaggle account and acceptance of the dataset terms are required.
-- Raw snapshot size: 1,675,133,810 bytes.
+- Underlying source: LendingClub.
+- Kaggle publisher and slug: `wordsforthewise/lending-club`.
+- Kaggle page: [https://www.kaggle.com/datasets/wordsforthewise/lending-club](https://www.kaggle.com/datasets/wordsforthewise/lending-club).
+- Local copy receipt/retrieval date: 2026-08-02.
+- Local file: `data/raw/accepted_2007_to_2018Q4.csv`.
+- Local snapshot size: 1,675,133,810 bytes.
 - SHA-256: `3eae03c28fd9d2e8a076ebeb73507e8d4d0f44d90500decdb0936e0933d1f36a`.
+
+The Kaggle version ID and license metadata were not persisted with the local copy. This
+repository does not redistribute the raw CSV. Users must obtain it from the Kaggle page under
+the page's current license and terms; a personal Kaggle account and acceptance of those terms
+may be required.
+
+Verify the local copy with:
+
+```bash
+shasum -a 256 data/raw/accepted_2007_to_2018Q4.csv
+```
 
 The raw CSV is ignored by Git. A different size or hash is a different snapshot and requires
 rerunning data preparation, training, calibration, threshold selection, and evaluation.
@@ -67,9 +80,10 @@ between configured windows.
 | Assigned total | 2011-01-01 to 2015-12-31 | 603,589 |
 | Outside horizon | Before 2011 or after 2015 | 417,179 |
 
-Train owns preprocessing and model fitting. Validation owns model, feature-set, imbalance, and
-hyperparameter selection. Calibration owns calibration-method evaluation/refit and policy
-threshold selection. Test is used only for final evaluation and post-selection diagnostics.
+In the reported workflow, train fits preprocessing and models; validation supports model,
+feature-set, imbalance, and hyperparameter selection; calibration supports calibration-method
+evaluation/refit and policy threshold selection; and test is reserved for final evaluation and
+post-selection diagnostics.
 
 ## Exclusions
 
