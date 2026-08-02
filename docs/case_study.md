@@ -47,8 +47,8 @@ On 283,026 test loans, ROC AUC is 0.662707 (nominal 95% percentile CI
 0.238800-0.244326), and Brier score is 0.121539 (nominal 95% percentile CI
 0.121380-0.121700). Log loss is 0.399637, KS is 0.236654, and expected calibration error is
 0.011108. ECE uses 10 equal-width probability bins and includes the upper endpoint in the final
-bin. These figures show measurable ranking signal and usable probability evidence, but only
-modest discrimination.
+bin. These figures show measurable ranking signal; aggregate ECE is 0.011108 on this historical
+holdout, while discrimination remains modest.
 
 The implemented equation is:
 

@@ -184,7 +184,7 @@ Across the 12 monthly test slices in 2015:
 | Brier score | 0.116677 | 0.126097 |
 | ECE | 0.002351 | 0.019466 |
 | Approval rate | 7.8160% | 10.5622% |
-| Scenario cost per 1,000 | USD 49,472.88 | USD 63,314.54 |
+| Partial scenario-cost proxy per 1,000 | USD 49,472.88 | USD 63,314.54 |
 
 Train-to-test prevalence also rises from 12.5195% to 14.8863%. These retrospective slices show
 variation within one historical test year; they do not demonstrate stability after 2015 or in
