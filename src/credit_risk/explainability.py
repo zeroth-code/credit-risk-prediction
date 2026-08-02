@@ -3,6 +3,8 @@ import warnings
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
+from shutil import copyfile
+from uuid import uuid4
 
 import numpy as np
 import pandas as pd
@@ -130,7 +132,10 @@ def _validated_feature_names(
     return row_count, feature_count, names
 
 
-def _validate_explanation_model(estimator: object, feature_count: int) -> LGBMClassifier:
+def _validate_explanation_model(
+    estimator: object,
+    feature_count: int,
+) -> tuple[LGBMClassifier, str, float]:
     if not isinstance(estimator, LGBMClassifier):
         raise ValueError("explanation model must be a fitted LightGBM classifier")
     try:
@@ -145,7 +150,25 @@ def _validate_explanation_model(estimator: object, feature_count: int) -> LGBMCl
     classes = np.asarray(getattr(estimator, "classes_", []))
     if classes.shape != (2,) or not np.array_equal(classes, np.array([0, 1])):
         raise ValueError("explanation model must be a fitted binary LightGBM classifier")
-    return estimator
+    booster = getattr(estimator, "booster_", None)
+    booster_params = getattr(booster, "params", None)
+    objective = booster_params.get("objective") if isinstance(booster_params, dict) else None
+    if objective != "binary":
+        raise ValueError(
+            f"fitted LightGBM objective must be binary for log-odds SHAP output, got {objective!r}"
+        )
+    configured_sigmoid = booster_params.get("sigmoid", 1.0)
+    if isinstance(configured_sigmoid, (bool, np.bool_)):
+        raise ValueError("fitted binary LightGBM sigmoid must be 1.0 for log-odds SHAP output")
+    try:
+        sigmoid = float(configured_sigmoid)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "fitted binary LightGBM sigmoid must be 1.0 for log-odds SHAP output"
+        ) from exc
+    if not np.isfinite(sigmoid) or sigmoid != 1.0:
+        raise ValueError("fitted binary LightGBM sigmoid must be 1.0 for log-odds SHAP output")
+    return estimator, objective, sigmoid
 
 
 def _dense_sample(
@@ -197,6 +220,39 @@ def _write_payload(path: Path, payload: dict[str, object]) -> None:
         output_file.write("\n")
 
 
+def _temporary_sibling(path: Path, token: str, role: str) -> Path:
+    return path.with_name(f".{path.stem}.{token}.{role}.staging{path.suffix}")
+
+
+def _validate_staged_files(paths: list[Path]) -> None:
+    missing_or_empty = [
+        path.name for path in paths if not path.is_file() or path.stat().st_size == 0
+    ]
+    if missing_or_empty:
+        raise RuntimeError(
+            f"SHAP staging outputs missing or empty: {', '.join(sorted(missing_or_empty))}"
+        )
+
+
+def _cleanup_temporary_files(paths: list[Path]) -> None:
+    for path in paths:
+        if path.is_file():
+            path.unlink()
+
+
+def _restore_published_outputs(
+    final_paths: list[Path],
+    previous_outputs: dict[Path, Path | None],
+) -> None:
+    for final_path in final_paths:
+        backup_path = previous_outputs[final_path]
+        if backup_path is None:
+            if final_path.is_file():
+                final_path.unlink()
+        elif backup_path.is_file():
+            backup_path.replace(final_path)
+
+
 def _save_figure(plt: object, path: Path, *, width: float, height: float) -> None:
     figure = plt.gcf()  # type: ignore[attr-defined]
     figure.set_size_inches(width, height)
@@ -231,7 +287,7 @@ def generate_shap_explanations(
     model_artifact_name: str = "uncalibrated_model.joblib",
 ) -> dict[str, object]:
     row_count, feature_count, names = _validated_feature_names(transformed, feature_names)
-    model = _validate_explanation_model(estimator, feature_count)
+    model, objective, sigmoid = _validate_explanation_model(estimator, feature_count)
     if len(scored) != row_count:
         raise ValueError("scored examples must align with transformed feature rows")
     if row_identifier_column is not None and row_identifier_column not in scored.columns:
@@ -270,6 +326,25 @@ def generate_shap_explanations(
         raise ValueError(
             "TreeExplainer must return finite SHAP values aligned with the sampled matrix"
         )
+    base_values = np.asarray(explanations.base_values, dtype=float)
+    if base_values.ndim == 0:
+        base_values = np.full(len(sample), float(base_values), dtype=float)
+    if base_values.shape != (len(sample),) or not np.isfinite(base_values).all():
+        raise ValueError("TreeExplainer must return finite base values aligned with the sample")
+    try:
+        raw_scores = np.asarray(model.predict(sample, raw_score=True), dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("LightGBM raw scores must be finite and aligned with the sample") from exc
+    reconstructed_raw_scores = base_values + shap_values.sum(axis=1)
+    if (
+        raw_scores.shape != (len(sample),)
+        or not np.isfinite(raw_scores).all()
+        or not np.isfinite(reconstructed_raw_scores).all()
+        or not np.allclose(raw_scores, reconstructed_raw_scores, rtol=1e-6, atol=1e-8)
+    ):
+        raise ValueError(
+            "TreeExplainer raw-score reconstruction does not match fitted LightGBM raw scores"
+        )
 
     artifact_path = Path(artifact_dir)
     figure_path = Path(figure_dir)
@@ -288,110 +363,16 @@ def generate_shap_explanations(
         ignore_index=True,
     )
     importance.insert(0, "rank", np.arange(1, len(importance) + 1, dtype=int))
-    importance.to_csv(
-        artifact_path / SHAP_IMPORTANCE_FILENAME,
-        index=False,
-        encoding="utf-8",
-        float_format="%.12g",
-    )
-
-    plt.close("all")
-    with _deterministic_plotting():
-        shap.plots.beeswarm(
-            explanations,
-            max_display=min(20, feature_count),
-            show=False,
-            plot_size=(10.0, 6.0),
-        )
-    _save_figure(
-        plt,
-        figure_path / SHAP_BEESWARM_FILENAME,
-        width=10.0,
-        height=6.0,
-    )
-
     top_feature_count = min(5, feature_count)
-    dependence_files: list[dict[str, object]] = []
-    for rank, importance_row in enumerate(
-        importance.itertuples(index=False),
-        start=1,
-    ):
-        if rank > top_feature_count:
-            break
-        feature = str(importance_row.feature)
-        feature_index = names.index(feature)
-        filename = SHAP_DEPENDENCE_FILENAMES[rank - 1]
-        plt.close("all")
-        with _deterministic_plotting():
-            shap.plots.scatter(
-                explanations[:, feature_index],
-                color="#1E88E5",
-                x_jitter=0,
-                title=f"Dependence: {feature}",
-                show=False,
-            )
-        _save_figure(
-            plt,
-            figure_path / filename,
-            width=8.0,
-            height=5.0,
-        )
-        dependence_files.append({"feature": feature, "filename": filename})
-
-    sample_lookup = {int(original): position for position, original in enumerate(sample_positions)}
-    local_explanations: dict[str, object] = {}
-    waterfall_files: dict[str, str] = {}
-    base_values = np.asarray(explanations.base_values, dtype=float)
-    for action in POLICY_ACTIONS:
-        scored_index = selected_indices[action]
-        original_position = int(scored.index.get_loc(scored_index))
-        explanation_position = sample_lookup[original_position]
-        local_values = shap_values[explanation_position]
-        contribution_indices = sorted(
-            range(feature_count),
-            key=lambda index: (-abs(float(local_values[index])), names[index]),
-        )[: min(5, feature_count)]
-        contributions = [
-            {
-                "feature": names[index],
-                "feature_value": float(sample[explanation_position, index]),
-                "shap_value": float(local_values[index]),
-            }
-            for index in contribution_indices
-        ]
-        filename = SHAP_WATERFALL_FILENAMES[action]
-        plt.close("all")
-        with _deterministic_plotting():
-            shap.plots.waterfall(
-                explanations[explanation_position],
-                max_display=min(10, feature_count),
-                show=False,
-            )
-        _save_figure(
-            plt,
-            figure_path / filename,
-            width=9.0,
-            height=6.0,
-        )
-        waterfall_files[action] = filename
-        row_identifier: dict[str, object] | None = None
-        if row_identifier_column is not None:
-            row_identifier = {
-                "column": row_identifier_column,
-                "value": _json_scalar(scored.loc[scored_index, row_identifier_column]),
-            }
-        base_value = float(base_values[explanation_position])
-        local_explanations[action] = {
-            "policy_action": action,
-            "scored_index": scored_index,
-            "row_identifier": row_identifier,
-            "calibrated_probability": float(scored.loc[scored_index, "probability"]),
-            "base_value": base_value,
-            "base_model_raw_output": float(base_value + np.sum(local_values)),
-            "top_contributions": contributions,
-            "waterfall": filename,
+    ranked_features = importance.head(top_feature_count)
+    dependence_files = [
+        {
+            "feature": str(row.feature),
+            "filename": SHAP_DEPENDENCE_FILENAMES[rank - 1],
         }
-
+        for rank, row in enumerate(ranked_features.itertuples(index=False), start=1)
+    ]
+    waterfall_files = dict(SHAP_WATERFALL_FILENAMES)
     global_top_features = [
         {
             "rank": int(row.rank),
@@ -400,36 +381,196 @@ def generate_shap_explanations(
         }
         for row in importance.head(5).itertuples(index=False)
     ]
-    payload: dict[str, object] = {
-        "schema_version": "1.0",
-        "explanation_model": {
-            "artifact": model_artifact_name,
-            "source": "frozen_uncalibrated_lightgbm",
-            "output_space": "raw_model_output",
-            "units": "log_odds",
-            "calibrated_probability_source": "frozen_calibrated_model",
-            "calibration_note": (
-                "SHAP values explain the frozen base LightGBM score, not the post-calibration "
-                "probability."
-            ),
-        },
-        "sample": {
-            "random_seed": SHAP_RANDOM_SEED,
-            "maximum_rows": MAX_SHAP_ROWS,
-            "test_rows": row_count,
-            "explained_rows": int(len(sample_positions)),
-        },
-        "feature_names": names,
-        "global_top_features": global_top_features,
-        "local_explanations": local_explanations,
-        "files": {
-            "importance": SHAP_IMPORTANCE_FILENAME,
-            "payload": SHAP_PAYLOAD_FILENAME,
-            "beeswarm": SHAP_BEESWARM_FILENAME,
-            "dependence": dependence_files,
-            "waterfalls": waterfall_files,
-        },
+
+    importance_final = artifact_path / SHAP_IMPORTANCE_FILENAME
+    payload_final = artifact_path / SHAP_PAYLOAD_FILENAME
+    beeswarm_final = figure_path / SHAP_BEESWARM_FILENAME
+    dependence_finals = [figure_path / item["filename"] for item in dependence_files]
+    waterfall_finals = [figure_path / filename for filename in waterfall_files.values()]
+    current_non_payload_finals = [
+        importance_final,
+        beeswarm_final,
+        *dependence_finals,
+        *waterfall_finals,
+    ]
+    known_final_paths = [
+        importance_final,
+        beeswarm_final,
+        *(figure_path / filename for filename in SHAP_DEPENDENCE_FILENAMES),
+        *waterfall_finals,
+        payload_final,
+    ]
+    token = uuid4().hex
+    staged_by_final = {
+        final_path: _temporary_sibling(final_path, token, "new")
+        for final_path in [*current_non_payload_finals, payload_final]
     }
-    _write_payload(artifact_path / SHAP_PAYLOAD_FILENAME, payload)
-    plt.close("all")
-    return payload
+    backup_by_final = {
+        final_path: _temporary_sibling(final_path, token, "backup")
+        for final_path in known_final_paths
+    }
+    temporary_paths = [*staged_by_final.values(), *backup_by_final.values()]
+    previous_outputs: dict[Path, Path | None] = {}
+    publish_started = False
+
+    try:
+        importance.to_csv(
+            staged_by_final[importance_final],
+            index=False,
+            encoding="utf-8",
+            float_format="%.12g",
+        )
+
+        plt.close("all")
+        with _deterministic_plotting():
+            shap.plots.beeswarm(
+                explanations,
+                max_display=min(20, feature_count),
+                show=False,
+                plot_size=(10.0, 6.0),
+            )
+        _save_figure(
+            plt,
+            staged_by_final[beeswarm_final],
+            width=10.0,
+            height=6.0,
+        )
+
+        for item, importance_row in zip(
+            dependence_files,
+            ranked_features.itertuples(index=False),
+            strict=True,
+        ):
+            feature = str(importance_row.feature)
+            feature_index = names.index(feature)
+            dependence_final = figure_path / str(item["filename"])
+            plt.close("all")
+            with _deterministic_plotting():
+                shap.plots.scatter(
+                    explanations[:, feature_index],
+                    color="#1E88E5",
+                    x_jitter=0,
+                    title=f"Dependence: {feature}",
+                    show=False,
+                )
+            _save_figure(
+                plt,
+                staged_by_final[dependence_final],
+                width=8.0,
+                height=5.0,
+            )
+
+        sample_lookup = {
+            int(original): position for position, original in enumerate(sample_positions)
+        }
+        local_explanations: dict[str, object] = {}
+        for action in POLICY_ACTIONS:
+            scored_index = selected_indices[action]
+            original_position = int(scored.index.get_loc(scored_index))
+            explanation_position = sample_lookup[original_position]
+            local_values = shap_values[explanation_position]
+            contribution_indices = sorted(
+                range(feature_count),
+                key=lambda index: (-abs(float(local_values[index])), names[index]),
+            )[: min(5, feature_count)]
+            contributions = [
+                {
+                    "feature": names[index],
+                    "feature_value": float(sample[explanation_position, index]),
+                    "shap_value": float(local_values[index]),
+                }
+                for index in contribution_indices
+            ]
+            filename = waterfall_files[action]
+            waterfall_final = figure_path / filename
+            plt.close("all")
+            with _deterministic_plotting():
+                shap.plots.waterfall(
+                    explanations[explanation_position],
+                    max_display=min(10, feature_count),
+                    show=False,
+                )
+            _save_figure(
+                plt,
+                staged_by_final[waterfall_final],
+                width=9.0,
+                height=6.0,
+            )
+            row_identifier: dict[str, object] | None = None
+            if row_identifier_column is not None:
+                row_identifier = {
+                    "column": row_identifier_column,
+                    "value": _json_scalar(scored.loc[scored_index, row_identifier_column]),
+                }
+            base_value = float(base_values[explanation_position])
+            local_explanations[action] = {
+                "policy_action": action,
+                "scored_index": scored_index,
+                "row_identifier": row_identifier,
+                "calibrated_probability": float(scored.loc[scored_index, "probability"]),
+                "base_value": base_value,
+                "base_model_raw_output": float(base_value + np.sum(local_values)),
+                "top_contributions": contributions,
+                "waterfall": filename,
+            }
+
+        payload: dict[str, object] = {
+            "schema_version": "1.0",
+            "explanation_model": {
+                "artifact": model_artifact_name,
+                "source": "frozen_uncalibrated_lightgbm",
+                "objective": objective,
+                "sigmoid": sigmoid,
+                "output_space": "raw_model_output",
+                "units": "log_odds",
+                "calibrated_probability_source": "frozen_calibrated_model",
+                "calibration_note": (
+                    "SHAP values explain the frozen base LightGBM score, not the "
+                    "post-calibration probability."
+                ),
+            },
+            "sample": {
+                "random_seed": SHAP_RANDOM_SEED,
+                "maximum_rows": MAX_SHAP_ROWS,
+                "test_rows": row_count,
+                "explained_rows": int(len(sample_positions)),
+            },
+            "feature_names": names,
+            "global_top_features": global_top_features,
+            "local_explanations": local_explanations,
+            "files": {
+                "importance": SHAP_IMPORTANCE_FILENAME,
+                "payload": SHAP_PAYLOAD_FILENAME,
+                "beeswarm": SHAP_BEESWARM_FILENAME,
+                "dependence": dependence_files,
+                "waterfalls": waterfall_files,
+            },
+        }
+        _write_payload(staged_by_final[payload_final], payload)
+        _validate_staged_files(list(staged_by_final.values()))
+
+        for final_path in known_final_paths:
+            if final_path.is_file():
+                backup_path = backup_by_final[final_path]
+                copyfile(final_path, backup_path)
+                previous_outputs[final_path] = backup_path
+            else:
+                previous_outputs[final_path] = None
+
+        publish_started = True
+        for final_path in current_non_payload_finals:
+            staged_by_final[final_path].replace(final_path)
+        current_dependence_finals = set(dependence_finals)
+        for filename in SHAP_DEPENDENCE_FILENAMES:
+            dependence_final = figure_path / filename
+            if dependence_final not in current_dependence_finals and dependence_final.is_file():
+                dependence_final.unlink()
+        staged_by_final[payload_final].replace(payload_final)
+        return payload
+    except Exception:
+        if publish_started:
+            _restore_published_outputs(known_final_paths, previous_outputs)
+        raise
+    finally:
+        _cleanup_temporary_files(temporary_paths)
+        plt.close("all")

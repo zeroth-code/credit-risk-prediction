@@ -8,6 +8,7 @@ from lightgbm import LGBMClassifier
 from scipy import sparse
 from sklearn.linear_model import LogisticRegression
 
+import credit_risk.explainability as explainability
 from credit_risk.explainability import (
     _sample_row_positions,
     generate_shap_explanations,
@@ -27,10 +28,27 @@ FIGURE_FILENAMES = {
 }
 
 
-def _explanation_inputs() -> tuple[LGBMClassifier, np.ndarray, list[str], pd.DataFrame]:
+def _custom_binary_objective(
+    y_true: np.ndarray,
+    raw_predictions: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    probabilities = 1.0 / (1.0 + np.exp(-raw_predictions))
+    gradient = probabilities - y_true
+    hessian = probabilities * (1.0 - probabilities)
+    return gradient, hessian
+
+
+def _explanation_inputs(
+    feature_count: int = 5,
+) -> tuple[LGBMClassifier, np.ndarray, list[str], pd.DataFrame]:
     random = np.random.default_rng(19)
-    matrix = random.normal(size=(30, 5))
-    target = (matrix[:, 0] + 0.7 * matrix[:, 1] - 0.4 * matrix[:, 2] > 0.0).astype(int)
+    matrix = random.normal(size=(30, feature_count))
+    signal = matrix[:, 0].copy()
+    if feature_count > 1:
+        signal += 0.7 * matrix[:, 1]
+    if feature_count > 2:
+        signal -= 0.4 * matrix[:, 2]
+    target = (signal > 0.0).astype(int)
     model = LGBMClassifier(
         n_estimators=12,
         num_leaves=5,
@@ -46,7 +64,7 @@ def _explanation_inputs() -> tuple[LGBMClassifier, np.ndarray, list[str], pd.Dat
             "probability": np.linspace(0.05, 0.95, 30),
         }
     )
-    return model, matrix, [f"feature_{index}" for index in range(5)], scored
+    return model, matrix, [f"feature_{index}" for index in range(feature_count)], scored
 
 
 def test_select_example_indices_returns_each_policy_action() -> None:
@@ -233,6 +251,8 @@ def test_generate_shap_explanations_writes_stable_compact_artifacts(
     assert payload["explanation_model"] == {
         "artifact": "uncalibrated_model.joblib",
         "source": "frozen_uncalibrated_lightgbm",
+        "objective": "binary",
+        "sigmoid": 1.0,
         "output_space": "raw_model_output",
         "units": "log_odds",
         "calibrated_probability_source": "frozen_calibrated_model",
@@ -281,6 +301,9 @@ def test_generate_shap_explanations_writes_stable_compact_artifacts(
         assert local["calibrated_probability"] == pytest.approx(
             scored.loc[expected_index, "probability"]
         )
+        assert local["base_model_raw_output"] == pytest.approx(
+            model.predict(matrix[[expected_index]], raw_score=True)[0]
+        )
         assert 1 <= len(local["top_contributions"]) <= 5
         assert local["waterfall"] == f"shap_waterfall_{action}.png"
 
@@ -319,6 +342,92 @@ def test_generate_shap_explanations_accepts_dense_transformed_matrix(tmp_path: P
 
     assert payload["sample"]["explained_rows"] == len(matrix)
     assert {path.name for path in (tmp_path / "figures").iterdir()} == FIGURE_FILENAMES
+
+
+def test_generate_shap_explanations_preserves_published_outputs_on_render_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model, matrix, feature_names, scored = _explanation_inputs()
+    artifact_dir = tmp_path / "artifacts"
+    figure_dir = tmp_path / "figures"
+    artifact_dir.mkdir()
+    figure_dir.mkdir()
+    final_paths = [
+        artifact_dir / "shap_importance.csv",
+        artifact_dir / "shap_explanations.json",
+        *(figure_dir / filename for filename in sorted(FIGURE_FILENAMES)),
+    ]
+    for path in final_paths:
+        path.write_bytes(f"old:{path.name}".encode())
+    original_bytes = {path: path.read_bytes() for path in final_paths}
+    original_save_figure = explainability._save_figure
+    render_calls = 0
+
+    def fail_second_render(
+        plt: object,
+        path: Path,
+        *,
+        width: float,
+        height: float,
+    ) -> None:
+        nonlocal render_calls
+        render_calls += 1
+        if render_calls == 2:
+            raise RuntimeError("injected render failure")
+        original_save_figure(plt, path, width=width, height=height)
+
+    monkeypatch.setattr(explainability, "_save_figure", fail_second_render)
+
+    with pytest.raises(RuntimeError, match="injected render failure"):
+        generate_shap_explanations(
+            model,
+            matrix,
+            feature_names,
+            scored,
+            artifact_dir=artifact_dir,
+            figure_dir=figure_dir,
+        )
+
+    assert {path: path.read_bytes() for path in final_paths} == original_bytes
+    assert all(".staging" not in path.name for path in artifact_dir.iterdir())
+    assert all(".staging" not in path.name for path in figure_dir.iterdir())
+
+
+def test_generate_shap_explanations_removes_obsolete_dependence_plots(
+    tmp_path: Path,
+) -> None:
+    artifact_dir = tmp_path / "artifacts"
+    figure_dir = tmp_path / "figures"
+    model, matrix, feature_names, scored = _explanation_inputs()
+    generate_shap_explanations(
+        model,
+        matrix,
+        feature_names,
+        scored,
+        artifact_dir=artifact_dir,
+        figure_dir=figure_dir,
+    )
+    smaller_model, smaller_matrix, smaller_names, smaller_scored = _explanation_inputs(3)
+
+    payload = generate_shap_explanations(
+        smaller_model,
+        smaller_matrix,
+        smaller_names,
+        smaller_scored,
+        artifact_dir=artifact_dir,
+        figure_dir=figure_dir,
+    )
+
+    assert not (figure_dir / "shap_dependence_04.png").exists()
+    assert not (figure_dir / "shap_dependence_05.png").exists()
+    assert payload["files"]["dependence"] == [
+        {
+            "feature": item["feature"],
+            "filename": f"shap_dependence_{rank:02d}.png",
+        }
+        for rank, item in enumerate(payload["global_top_features"], start=1)
+    ]
 
 
 @pytest.mark.parametrize(
@@ -368,6 +477,84 @@ def test_generate_shap_explanations_rejects_unfitted_lightgbm(tmp_path: Path) ->
     with pytest.raises(ValueError, match="fitted LightGBM"):
         generate_shap_explanations(
             LGBMClassifier(),
+            matrix,
+            feature_names,
+            scored,
+            artifact_dir=tmp_path / "artifacts",
+            figure_dir=tmp_path / "figures",
+        )
+
+
+@pytest.mark.parametrize(
+    "objective",
+    ["regression", _custom_binary_objective],
+    ids=["regression", "custom"],
+)
+def test_generate_shap_explanations_rejects_unsupported_fitted_objective(
+    tmp_path: Path,
+    objective: object,
+) -> None:
+    _, matrix, feature_names, scored = _explanation_inputs()
+    target = np.array([0, 1] * 15)
+    model = LGBMClassifier(
+        objective=objective,
+        n_estimators=4,
+        min_child_samples=1,
+        random_state=19,
+        n_jobs=1,
+        verbosity=-1,
+    ).fit(matrix, target)
+
+    with pytest.raises(ValueError, match="objective.*binary"):
+        generate_shap_explanations(
+            model,
+            matrix,
+            feature_names,
+            scored,
+            artifact_dir=tmp_path / "artifacts",
+            figure_dir=tmp_path / "figures",
+        )
+
+
+def test_generate_shap_explanations_rejects_raw_score_reconstruction_mismatch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model, matrix, feature_names, scored = _explanation_inputs()
+    monkeypatch.setattr(
+        model,
+        "predict",
+        lambda sample, *, raw_score: np.zeros(len(sample), dtype=float),
+    )
+
+    with pytest.raises(ValueError, match="raw-score reconstruction"):
+        generate_shap_explanations(
+            model,
+            matrix,
+            feature_names,
+            scored,
+            artifact_dir=tmp_path / "artifacts",
+            figure_dir=tmp_path / "figures",
+        )
+
+
+def test_generate_shap_explanations_rejects_nondefault_binary_sigmoid(
+    tmp_path: Path,
+) -> None:
+    _, matrix, feature_names, scored = _explanation_inputs()
+    model = LGBMClassifier(
+        objective="binary",
+        sigmoid=2.0,
+        n_estimators=4,
+        min_child_samples=1,
+        random_state=19,
+        n_jobs=1,
+        verbosity=-1,
+    ).fit(matrix, np.array([0, 1] * 15))
+
+    with pytest.raises(ValueError, match="sigmoid.*1.0"):
+        generate_shap_explanations(
+            model,
             matrix,
             feature_names,
             scored,
